@@ -3,6 +3,7 @@ import pytube
 import pytube.cli
 import cv2
 import tqdm
+import subprocess
 from pathlib import Path
 
 import detectron2
@@ -79,6 +80,11 @@ def detect_objects(args):
     frame_list = sorted(source_frames_dir.glob("frame_*.png"))
     with tqdm.tqdm(total=len(frame_list)) as pbar:
         for frame_path in frame_list:
+            pbar.update(1)
+            output_frame_path = target_frames_dir / frame_path.name
+            if output_frame_path.exists():
+                continue
+
             frame = cv2.imread(str(frame_path))
 
             predictions = predictor(frame)
@@ -87,9 +93,17 @@ def detect_objects(args):
             v = Visualizer(frame[:, :, ::-1], MetadataCatalog.get(cfg.DATASETS.TRAIN[0]), scale=1.2)
             v = v.draw_instance_predictions(predictions["instances"])
 
-            output_frame_path = target_frames_dir / frame_path.name
             cv2.imwrite(str(output_frame_path), v.get_image()[:, :, ::-1])
-            pbar.update(1)
+    print("All frames processed.")
+
+
+def assemble_result(args):
+    source_frames_dir = args.working_dir / f"frames_{args.video_id}__default"
+    subprocess.run([
+        "ffmpeg", "-r", "25", "-i",
+        str(source_frames_dir / "frame_%04d.png"),
+        "-y", str(args.working_dir / f"video_{args.video_id}__default.mp4")
+    ])
 
 
 if __name__ == "__main__":
@@ -104,5 +118,7 @@ if __name__ == "__main__":
         preprocess_video(args)
     elif args.action == "detect_objects":
         detect_objects(args)
+    elif args.action == "assemble_result":
+        assemble_result(args)
     else:
         raise NotImplementedError(f"Unknown action: {args.action}")
