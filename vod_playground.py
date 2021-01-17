@@ -5,6 +5,13 @@ import cv2
 import tqdm
 from pathlib import Path
 
+import detectron2
+from detectron2.engine import DefaultPredictor
+from detectron2.config import get_cfg
+from detectron2.utils.visualizer import Visualizer
+from detectron2.data import MetadataCatalog
+from detectron2.structures import Instances
+
 
 def preprocess_video(args):
     yt_url = f"https://www.youtube.com/watch?v={args.video_id}"
@@ -37,8 +44,52 @@ def preprocess_video(args):
         print(f"Extracted {count+1} frames.")
 
 
+def restrict_predictions(cfg, predictions, allowed_classes=None):
+    if allowed_classes is None:
+        return predictions
+
+    classes = MetadataCatalog.get(cfg.DATASETS.TRAIN[0]).thing_classes
+    allowed_class_indices = {classes.index(c) for c in allowed_classes}
+    instances_to_keep = [i for i,c in enumerate(predictions["instances"].pred_classes.numpy()) if c in allowed_class_indices]
+
+    return {"instances": Instances(
+        image_size=predictions["instances"].image_size,
+        pred_boxes=predictions["instances"].pred_boxes[instances_to_keep],
+        scores=predictions["instances"].scores[instances_to_keep],
+        pred_classes=predictions["instances"].pred_classes[instances_to_keep]
+    )}
+
+
 def detect_objects(args):
-    pass
+    source_frames_dir = args.working_dir / f"frames_{args.video_id}"
+    target_frames_dir = args.working_dir / f"frames_{args.video_id}__default"
+
+    target_frames_dir.mkdir(exist_ok=True)
+
+    cfg = get_cfg()
+    cfg.merge_from_file(Path(detectron2.__file__).resolve().parent / "model_zoo/configs/COCO-Detection/faster_rcnn_R_101_FPN_3x.yaml")
+    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5
+    cfg.MODEL.WEIGHTS = "detectron2://COCO-Detection/faster_rcnn_R_101_FPN_3x/137851257/model_final_f6e8b1.pkl"
+    cfg.MODEL.DEVICE = "cpu"
+
+    print("Loading model.")
+    predictor = DefaultPredictor(cfg)
+
+    print("Starting to detect objects in frames using the default approach.")
+    frame_list = sorted(source_frames_dir.glob("frame_*.png"))
+    with tqdm.tqdm(total=len(frame_list)) as pbar:
+        for frame_path in frame_list:
+            frame = cv2.imread(str(frame_path))
+
+            predictions = predictor(frame)
+            predictions = restrict_predictions(cfg, predictions, {args.class_to_detect})
+
+            v = Visualizer(frame[:, :, ::-1], MetadataCatalog.get(cfg.DATASETS.TRAIN[0]), scale=1.2)
+            v = v.draw_instance_predictions(predictions["instances"])
+
+            output_frame_path = target_frames_dir / frame_path.name
+            cv2.imwrite(str(output_frame_path), v.get_image()[:, :, ::-1])
+            pbar.update(1)
 
 
 if __name__ == "__main__":
