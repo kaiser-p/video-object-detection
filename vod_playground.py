@@ -55,7 +55,7 @@ def preprocess_video(args):
 
     if not proposals_dir.exists():
         proposals_dir.mkdir(parents=False, exist_ok=False)
-    frame_list = list(frames_dir.glob(f"frame_*.png"))
+    frame_list = sorted(frames_dir.glob(f"frame_*.png"))
     with tqdm.tqdm(total=len(frame_list)) as pbar:
         for frame_path in frame_list:
             pbar.update(1)
@@ -83,12 +83,12 @@ def display_frame(args):
     frame_path = frames_dir / f"frame_{int(args.frame_id):04d}.png"
 
     print(f"Visualizing proposals for {args.video_id}.")
-    print(f"Loading prpopsals from {proposals_path}")
+    print(f"Loading proposals from {proposals_path}")
 
     with proposals_path.open("rb") as f_in:
         proposals = pickle.load(f_in)
 
-    #proposals = restrict_predictions(cfg, proposals, {args.class_to_detect})
+    proposals = restrict_predictions(cfg, proposals, {args.class_to_detect})
 
     frame = cv2.imread(str(frame_path))
     v = Visualizer(frame[:, :, ::-1], MetadataCatalog.get(cfg.DATASETS.TRAIN[0]), scale=1.2)
@@ -96,6 +96,38 @@ def display_frame(args):
 
     cv2.imshow("image", v.get_image()[:, :, ::-1])
     cv2.waitKey(0)
+
+
+def render_video(args):
+    cfg, _ = load_model(config_only=True)
+
+    proposals_dir = args.working_dir / f"proposals_{args.video_id}"
+    frames_dir = args.working_dir / f"frames_{args.video_id}"
+    rendered_frames_dir = args.working_dir / f"rendered_frames_{args.video_id}"
+
+    if not rendered_frames_dir.exists():
+        rendered_frames_dir.mkdir()
+
+    print(f"Rendering video for {args.video_id}.")
+    frame_list = sorted(frames_dir.glob("frame_*.png"))
+    with tqdm.tqdm(total=len(frame_list)) as pbar:
+        for frame_path in frame_list:
+            pbar.update(1)
+            proposals_path = proposals_dir / frame_path.with_suffix(".pickle").name
+            rendered_frame_path = rendered_frames_dir / frame_path.name
+
+            if rendered_frame_path.exists():
+                continue
+
+            with proposals_path.open("rb") as f_in:
+                proposals = pickle.load(f_in)
+
+            proposals = restrict_predictions(cfg, proposals, {args.class_to_detect})
+
+            frame = cv2.imread(str(frame_path))
+            v = Visualizer(frame[:, :, ::-1], MetadataCatalog.get(cfg.DATASETS.TRAIN[0]), scale=1.2)
+            v = v.draw_instance_predictions(proposals["instances"])
+            cv2.imwrite(str(rendered_frame_path), v.get_image()[:, :, ::-1])
 
 
 def restrict_predictions(cfg, predictions, allowed_classes=None):
@@ -260,56 +292,12 @@ def detect_objects(args):
             cv2.waitKey(0)
 
 
-
-
-def detect_objects_old(args):
-    source_frames_dir = args.working_dir / f"frames_{args.video_id}"
-    target_frames_dir = args.working_dir / f"frames_{args.video_id}__default"
-
-    target_frames_dir.mkdir(exist_ok=True)
-
-    cfg = get_cfg()
-    cfg.merge_from_file(Path(detectron2.__file__).resolve().parent / "model_zoo/configs/COCO-Detection/faster_rcnn_R_101_FPN_3x.yaml")
-    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5
-    cfg.MODEL.WEIGHTS = "detectron2://COCO-Detection/faster_rcnn_R_101_FPN_3x/137851257/model_final_f6e8b1.pkl"
-    cfg.MODEL.DEVICE = "cpu"
-
-    print("Loading model.")
-    predictor = DefaultPredictor(cfg)
-
-    print("Starting to detect objects in frames using the default approach.")
-    if args.frame_id is None:
-        frame_list = sorted(source_frames_dir.glob("frame_*.png"))
-    else:
-        frame_list = [source_frames_dir / f"frame_{args.frame_id}.png"]
-    with tqdm.tqdm(total=len(frame_list)) as pbar:
-        for frame_path in frame_list:
-            pbar.update(1)
-            output_frame_path = target_frames_dir / frame_path.name
-            if output_frame_path.exists():
-                continue
-
-            frame = cv2.imread(str(frame_path))
-
-            predictions = predictor(frame)
-            predictions = restrict_predictions(cfg, predictions, {args.class_to_detect})
-
-            v = Visualizer(frame[:, :, ::-1], MetadataCatalog.get(cfg.DATASETS.TRAIN[0]), scale=1.2)
-            v = v.draw_instance_predictions(predictions["instances"])
-
-            cv2.imshow("image", v.get_image()[:, :, ::-1])
-            cv2.waitKey(0)
-
-            #cv2.imwrite(str(output_frame_path), v.get_image()[:, :, ::-1])
-    print("All frames processed.")
-
-
 def assemble_result(args):
-    source_frames_dir = args.working_dir / f"frames_{args.video_id}__default"
+    source_frames_dir = args.working_dir / f"rendered_frames_{args.video_id}"
     subprocess.run([
         "ffmpeg", "-r", "25", "-i",
         str(source_frames_dir / "frame_%04d.png"),
-        "-y", str(args.working_dir / f"video_{args.video_id}__default.mp4")
+        "-y", str(args.working_dir / f"video_{args.video_id}.mp4")
     ])
 
 
@@ -326,8 +314,10 @@ if __name__ == "__main__":
 
     if args.action == "preprocess_video":
         preprocess_video(args)
-    elif args.action == "display":
+    elif args.action == "display_frame":
         display_frame(args)
+    elif args.action == "render_video":
+        render_video(args)
     elif args.action == "detect_objects":
         detect_objects(args)
     elif args.action == "assemble_result":
