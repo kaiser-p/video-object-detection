@@ -5,15 +5,17 @@ import cv2
 import tqdm
 import subprocess
 import pickle
+import itertools
 from pathlib import Path
+import numpy as np
 
 import torch
 import detectron2
 from detectron2.engine import DefaultPredictor
 from detectron2.config import get_cfg
-from detectron2.utils.visualizer import Visualizer
+from detectron2.utils.visualizer import Visualizer, ColorMode, GenericMask, _create_text_labels
 from detectron2.data import MetadataCatalog
-from detectron2.structures import Instances, Boxes
+from detectron2.structures import Instances, Boxes, pairwise_iou
 
 
 def preprocess_video(args):
@@ -98,36 +100,174 @@ def display_frame(args):
     cv2.waitKey(0)
 
 
+class Tubelet:
+    def __init__(self, start_index, proposal_instance, iou_threshold=0.5):
+        self.frame_ids = [start_index]
+        self.proposal_instances = [proposal_instance]
+        self.iou_threshold = iou_threshold
+
+    def extend(self, frame_index, proposal_instances):
+        for i in range(len(proposal_instances)):
+            proposal_instance = proposal_instances[i]
+            last_index = self.frame_ids[-1]
+            if frame_index - last_index > 1:
+                # This tubelet died at least one frame ago
+                return
+            if last_index == frame_index:
+                # We already have a candidate for a continuation of this tubelet
+                # See if this one fits as well and then decide for the one with the highest score
+                cand_instance = self.proposal_instances[-1]
+                last_instance = self.proposal_instances[-2]
+                iou = pairwise_iou(last_instance.pred_boxes, proposal_instance.pred_boxes)
+                if iou > self.iou_threshold and proposal_instance.scores > cand_instance.scores:
+                    self.proposal_instances[-1] = proposal_instance
+            else:
+                # This is the first candidate to consider for extending the tubelet
+                last_instance = self.proposal_instances[-1]
+                iou = pairwise_iou(last_instance.pred_boxes, proposal_instance.pred_boxes)
+                if iou > self.iou_threshold:
+                    self.frame_ids.append(frame_index)
+                    self.proposal_instances.append(proposal_instance)
+
+    def collides_with(self, frame_index, proposal_instance):
+        last_index = self.frame_ids[-1]
+        if last_index != frame_index:
+            return False
+        last_instance = self.proposal_instances[-1]
+        iou = pairwise_iou(last_instance.pred_boxes, proposal_instance.pred_boxes)
+        if iou > self.iou_threshold:
+            return True
+
+    def __len__(self):
+        return len(self.frame_ids)
+
+    def is_active(self, frame_id):
+        return self.frame_ids[-1] == frame_id
+
+    def get_instance(self, frame_id):
+        if frame_id not in self.frame_ids:
+            return None
+        else:
+            i = self.frame_ids.index(frame_id)
+            return self.proposal_instances[i]
+
+
+
+def generate_tubelets(args, proposals_dict, threshold=0.7):
+    if args.method == "none":
+        return proposals_dict
+    elif args.method == "default":
+        return proposals_dict
+    elif args.method == "custom":
+        tubelets = []
+        with tqdm.tqdm(total=len(proposals_dict)) as pbar:
+            for i, frame_path in enumerate(sorted(proposals_dict.keys())):
+                pbar.update(1)
+                #print(f"Frame #{i}: {frame_path}")
+                proposal_instances = proposals_dict[frame_path]["instances"]
+                for tubelet in tubelets:
+                    tubelet.extend(i, proposal_instances)
+                key_proposal_indices = torch.nonzero(proposal_instances.scores > threshold)
+                #print(f"Frame #{i}: Found {key_proposal_indices.shape[0]} key proposal indices.")
+                for key_proposal_index in key_proposal_indices:
+                    key_proposal_instance = proposal_instances[key_proposal_index]
+                    if not any(t.collides_with(i, key_proposal_instance) for t in tubelets):
+                        tubelets.append(Tubelet(i, key_proposal_instance))
+        print(f"Tubelet statistics:")
+        print(f"    - Overall: {len(tubelets)}, avergae length: {sum(len(t) for t in tubelets) / len(tubelets) if tubelets else 0}")
+        return tubelets
+
+
+def draw_instance_predictions(visualizer, instances):
+    def get_color(i):
+        colors = "bgrcmykw"
+        return colors[i % len(colors)]
+
+    tubelet_ids = [i[0] for i in instances]
+    predictions = Instances.cat([i[1] for i in instances])
+
+    boxes = predictions.pred_boxes if predictions.has("pred_boxes") else None
+    scores = predictions.scores if predictions.has("scores") else None
+    classes = predictions.pred_classes if predictions.has("pred_classes") else None
+    labels = _create_text_labels(classes, scores, visualizer.metadata.get("thing_classes", None))
+    keypoints = predictions.pred_keypoints if predictions.has("pred_keypoints") else None
+
+    if predictions.has("pred_masks"):
+        masks = np.asarray(predictions.pred_masks)
+        masks = [GenericMask(x, visualizer.output.height, visualizer.output.width) for x in masks]
+    else:
+        masks = None
+
+    colors = [get_color(i) for i in tubelet_ids]
+    visualizer.overlay_instances(
+        masks=masks,
+        boxes=boxes,
+        labels=labels,
+        keypoints=keypoints,
+        assigned_colors=colors,
+        alpha=0.5,
+    )
+    return visualizer.output
+
+
+
 def render_video(args):
     cfg, _ = load_model(config_only=True)
 
     proposals_dir = args.working_dir / f"proposals_{args.video_id}"
     frames_dir = args.working_dir / f"frames_{args.video_id}"
-    rendered_frames_dir = args.working_dir / f"rendered_frames_{args.video_id}"
+    rendered_frames_dir = args.working_dir / f"rendered_frames_{args.video_id}__{args.method}"
 
     if not rendered_frames_dir.exists():
         rendered_frames_dir.mkdir()
 
-    print(f"Rendering video for {args.video_id}.")
     frame_list = sorted(frames_dir.glob("frame_*.png"))
+    print(f"Loading {len(frame_list)} frames and proposals")
+    proposals_dict = {}
     with tqdm.tqdm(total=len(frame_list)) as pbar:
-        for frame_path in frame_list:
+        for i, frame_path in enumerate(frame_list):
             pbar.update(1)
-            proposals_path = proposals_dir / frame_path.with_suffix(".pickle").name
-            rendered_frame_path = rendered_frames_dir / frame_path.name
+            frame_id = int(frame_path.name[frame_path.name.find("_")+1:frame_path.name.find(".")])
+            if frame_id < 1500 or frame_id > 1900:
+                continue
 
+            proposals_path = proposals_dir / frame_path.with_suffix(".pickle").name
+            if not proposals_path.exists():
+                continue
+            with proposals_path.open("rb") as f_in:
+                proposals = pickle.load(f_in)
+            proposals_dict[frame_path] = restrict_predictions(cfg, proposals, {args.class_to_detect})
+
+    print(f"Generating tubelets for {args.video_id}")
+    tubelets = generate_tubelets(args, proposals_dict)
+
+    print(f"Rendering frames for {args.video_id}.")
+    with tqdm.tqdm(total=len(frame_list)) as pbar:
+        for i, frame_path in enumerate(frame_list):
+            pbar.update(1)
+            frame_id = int(frame_path.name[frame_path.name.find("_")+1:frame_path.name.find(".")])
+            if frame_id < 1500 or frame_id > 1900:
+                continue
+
+            rendered_frame_path = rendered_frames_dir / frame_path.name
             if rendered_frame_path.exists():
                 continue
 
-            with proposals_path.open("rb") as f_in:
-                proposals = pickle.load(f_in)
-
-            proposals = restrict_predictions(cfg, proposals, {args.class_to_detect})
+            #proposals = proposals_dict[frame_path]
+            instances = []
+            for tubelet_id, tubelet in enumerate(tubelets):
+                instance = tubelet.get_instance(i - 1500)
+                if instance is not None:
+                    instances.append((tubelet_id, instance))
+            print(f"Frame #{i}: {len(instances)} instances")
 
             frame = cv2.imread(str(frame_path))
-            v = Visualizer(frame[:, :, ::-1], MetadataCatalog.get(cfg.DATASETS.TRAIN[0]), scale=1.2)
-            v = v.draw_instance_predictions(proposals["instances"])
-            cv2.imwrite(str(rendered_frame_path), v.get_image()[:, :, ::-1])
+            if instances:
+                v = Visualizer(frame[:, :, ::-1], MetadataCatalog.get(cfg.DATASETS.TRAIN[0]), scale=1.2)
+                v = draw_instance_predictions(v, instances)
+                cv2.imwrite(str(rendered_frame_path), v.get_image()[:, :, ::-1])
+            else:
+                cv2.imwrite(str(rendered_frame_path), frame)
 
 
 def restrict_predictions(cfg, predictions, allowed_classes=None):
@@ -295,7 +435,7 @@ def detect_objects(args):
 def assemble_result(args):
     source_frames_dir = args.working_dir / f"rendered_frames_{args.video_id}"
     subprocess.run([
-        "ffmpeg", "-r", "25", "-i",
+        "ffmpeg", "-r", "25", "-start_number", "1500", "-i",
         str(source_frames_dir / "frame_%04d.png"),
         "-y", str(args.working_dir / f"video_{args.video_id}.mp4")
     ])
@@ -308,6 +448,7 @@ if __name__ == "__main__":
     parser.add_argument("--video_id", default="eKKdRy20HXI")
     parser.add_argument("--class_to_detect", default="car")
     parser.add_argument("--frame_id", default=None)
+    parser.add_argument("--method", default="none", help="One of: none, default, custom")
     args = parser.parse_args()
 
     args.working_dir = Path(args.working_dir)
