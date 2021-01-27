@@ -101,23 +101,27 @@ def display_frame(args):
 
 
 class Tubelet:
-    def __init__(self, start_index, proposal_instance, iou_threshold=0.5):
+    def __init__(self, start_index, proposal_instance, iou_threshold=0.5, num_skippable_frames=5):
         self.frame_ids = [start_index]
         self.proposal_instances = [proposal_instance]
         self.iou_threshold = iou_threshold
+        self.num_skippable_frames = num_skippable_frames
 
     def extend(self, frame_index, proposal_instances):
         for i in range(len(proposal_instances)):
             proposal_instance = proposal_instances[i]
             last_index = self.frame_ids[-1]
-            if frame_index - last_index > 1:
-                # This tubelet died at least one frame ago
+            if frame_index - last_index > self.num_skippable_frames:
+                # This tubelet died
                 return
             if last_index == frame_index:
                 # We already have a candidate for a continuation of this tubelet
                 # See if this one fits as well and then decide for the one with the highest score
                 cand_instance = self.proposal_instances[-1]
-                last_instance = self.proposal_instances[-2]
+                last_instance_index = -2
+                while self.proposal_instances[last_instance_index] is None and last_instance_index > -len(self.proposal_instances):
+                    last_instance_index -= 1
+                last_instance = self.proposal_instances[last_instance_index]
                 iou = pairwise_iou(last_instance.pred_boxes, proposal_instance.pred_boxes)
                 if iou > self.iou_threshold and proposal_instance.scores > cand_instance.scores:
                     self.proposal_instances[-1] = proposal_instance
@@ -126,6 +130,9 @@ class Tubelet:
                 last_instance = self.proposal_instances[-1]
                 iou = pairwise_iou(last_instance.pred_boxes, proposal_instance.pred_boxes)
                 if iou > self.iou_threshold:
+                    for i in range(last_index, frame_index):
+                        self.frame_ids.append(i)
+                        self.proposal_instances.append(None)
                     self.frame_ids.append(frame_index)
                     self.proposal_instances.append(proposal_instance)
 
@@ -149,11 +156,29 @@ class Tubelet:
             return None
         else:
             i = self.frame_ids.index(frame_id)
-            return self.proposal_instances[i]
+            if self.proposal_instances[i] is not None:
+                return self.proposal_instances[i]
+            else:
+                # This has been a skipped frame ... interpolate box from the neighboring instances
+                index_before = index_after = i
+                while self.proposal_instances[index_before] is None and index_before > 0:
+                    index_before -= 1
+                while self.proposal_instances[index_after] is None and index_after < len(self.proposal_instances):
+                    index_after += 1
+                instance_before = self.proposal_instances[index_before]
+                instance_after = self.proposal_instances[index_after]
+
+                interpolation_factor = (i - index_before) / (index_after - index_before)
+
+                interpolated_instance = Instances(instance_before.image_size)
+                interpolated_instance.pred_boxes = Boxes(instance_before.pred_boxes.tensor + interpolation_factor * (instance_after.pred_boxes.tensor - instance_before.pred_boxes.tensor))
+                interpolated_instance.scores = torch.tensor([0])
+                interpolated_instance.pred_classes = instance_before.pred_classes
+                return interpolated_instance
 
 
 
-def generate_tubelets(args, proposals_dict, threshold=0.7):
+def generate_tubelets(args, proposals_dict, threshold=0.6):
     if args.method == "none":
         return proposals_dict
     elif args.method == "default":
@@ -163,12 +188,10 @@ def generate_tubelets(args, proposals_dict, threshold=0.7):
         with tqdm.tqdm(total=len(proposals_dict)) as pbar:
             for i, frame_path in enumerate(sorted(proposals_dict.keys())):
                 pbar.update(1)
-                #print(f"Frame #{i}: {frame_path}")
                 proposal_instances = proposals_dict[frame_path]["instances"]
                 for tubelet in tubelets:
                     tubelet.extend(i, proposal_instances)
                 key_proposal_indices = torch.nonzero(proposal_instances.scores > threshold)
-                #print(f"Frame #{i}: Found {key_proposal_indices.shape[0]} key proposal indices.")
                 for key_proposal_index in key_proposal_indices:
                     key_proposal_instance = proposal_instances[key_proposal_index]
                     if not any(t.collides_with(i, key_proposal_instance) for t in tubelets):
@@ -228,8 +251,8 @@ def render_video(args):
         for i, frame_path in enumerate(frame_list):
             pbar.update(1)
             frame_id = int(frame_path.name[frame_path.name.find("_")+1:frame_path.name.find(".")])
-            if frame_id < 1500 or frame_id > 1900:
-                continue
+            #if frame_id < 1500 or frame_id > 1600:
+            #    continue
 
             proposals_path = proposals_dir / frame_path.with_suffix(".pickle").name
             if not proposals_path.exists():
@@ -246,17 +269,16 @@ def render_video(args):
         for i, frame_path in enumerate(frame_list):
             pbar.update(1)
             frame_id = int(frame_path.name[frame_path.name.find("_")+1:frame_path.name.find(".")])
-            if frame_id < 1500 or frame_id > 1900:
-                continue
+            #if frame_id < 1500 or frame_id > 1600:
+            #    continue
 
             rendered_frame_path = rendered_frames_dir / frame_path.name
             if rendered_frame_path.exists():
                 continue
 
-            #proposals = proposals_dict[frame_path]
             instances = []
             for tubelet_id, tubelet in enumerate(tubelets):
-                instance = tubelet.get_instance(i - 1500)
+                instance = tubelet.get_instance(i)
                 if instance is not None:
                     instances.append((tubelet_id, instance))
             print(f"Frame #{i}: {len(instances)} instances")
@@ -433,11 +455,11 @@ def detect_objects(args):
 
 
 def assemble_result(args):
-    source_frames_dir = args.working_dir / f"rendered_frames_{args.video_id}"
+    source_frames_dir = args.working_dir / f"rendered_frames_{args.video_id}__custom"
     subprocess.run([
         "ffmpeg", "-r", "25", "-start_number", "1500", "-i",
         str(source_frames_dir / "frame_%04d.png"),
-        "-y", str(args.working_dir / f"video_{args.video_id}.mp4")
+        "-y", str(args.working_dir / f"video_{args.video_id}__custom.mp4")
     ])
 
 
