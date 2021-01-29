@@ -101,7 +101,7 @@ def display_frame(args):
 
 
 class Tubelet:
-    def __init__(self, start_index, proposal_instance, iou_threshold=0.5, num_skippable_frames=5):
+    def __init__(self, start_index, proposal_instance, iou_threshold=0.5, num_skippable_frames=3):
         self.frame_ids = [start_index]
         self.proposal_instances = [proposal_instance]
         self.iou_threshold = iou_threshold
@@ -178,27 +178,29 @@ class Tubelet:
 
 
 
-def generate_tubelets(args, proposals_dict, threshold=0.6):
+def generate_tubelets(args, proposals_dict, threshold=0.6, start_frame=0):
     if args.method == "none":
         return proposals_dict
     elif args.method == "default":
         return proposals_dict
-    elif args.method == "custom":
+    elif args.method == "tubelet":
         tubelets = []
         with tqdm.tqdm(total=len(proposals_dict)) as pbar:
             for i, frame_path in enumerate(sorted(proposals_dict.keys())):
                 pbar.update(1)
                 proposal_instances = proposals_dict[frame_path]["instances"]
                 for tubelet in tubelets:
-                    tubelet.extend(i, proposal_instances)
+                    tubelet.extend(i+start_frame, proposal_instances)
                 key_proposal_indices = torch.nonzero(proposal_instances.scores > threshold)
                 for key_proposal_index in key_proposal_indices:
                     key_proposal_instance = proposal_instances[key_proposal_index]
-                    if not any(t.collides_with(i, key_proposal_instance) for t in tubelets):
-                        tubelets.append(Tubelet(i, key_proposal_instance))
+                    if not any(t.collides_with(i+start_frame, key_proposal_instance) for t in tubelets):
+                        tubelets.append(Tubelet(i+start_frame, key_proposal_instance))
         print(f"Tubelet statistics:")
         print(f"    - Overall: {len(tubelets)}, avergae length: {sum(len(t) for t in tubelets) / len(tubelets) if tubelets else 0}")
         return tubelets
+    else:
+        raise ValueError(f"Unknown method: {args.method}")
 
 
 def draw_instance_predictions(visualizer, instances):
@@ -251,8 +253,10 @@ def render_video(args):
         for i, frame_path in enumerate(frame_list):
             pbar.update(1)
             frame_id = int(frame_path.name[frame_path.name.find("_")+1:frame_path.name.find(".")])
-            #if frame_id < 1500 or frame_id > 1600:
-            #    continue
+            if args.frame_start is not None and frame_id < args.frame_start:
+                continue
+            if args.frame_stop is not None and frame_id > args.frame_stop:
+                continue
 
             proposals_path = proposals_dir / frame_path.with_suffix(".pickle").name
             if not proposals_path.exists():
@@ -262,15 +266,17 @@ def render_video(args):
             proposals_dict[frame_path] = restrict_predictions(cfg, proposals, {args.class_to_detect})
 
     print(f"Generating tubelets for {args.video_id}")
-    tubelets = generate_tubelets(args, proposals_dict)
+    tubelets = generate_tubelets(args, proposals_dict, start_frame=args.frame_start if args.frame_start is not None else 0)
 
     print(f"Rendering frames for {args.video_id}.")
     with tqdm.tqdm(total=len(frame_list)) as pbar:
         for i, frame_path in enumerate(frame_list):
             pbar.update(1)
             frame_id = int(frame_path.name[frame_path.name.find("_")+1:frame_path.name.find(".")])
-            #if frame_id < 1500 or frame_id > 1600:
-            #    continue
+            if args.frame_start is not None and frame_id < args.frame_start:
+                continue
+            if args.frame_stop is not None and frame_id > args.frame_stop:
+                continue
 
             rendered_frame_path = rendered_frames_dir / frame_path.name
             if rendered_frame_path.exists():
@@ -278,7 +284,7 @@ def render_video(args):
 
             instances = []
             for tubelet_id, tubelet in enumerate(tubelets):
-                instance = tubelet.get_instance(i)
+                instance = tubelet.get_instance(frame_id)
                 if instance is not None:
                     instances.append((tubelet_id, instance))
             print(f"Frame #{i}: {len(instances)} instances")
@@ -469,11 +475,14 @@ if __name__ == "__main__":
     parser.add_argument("--working_dir", default="/tmp/video-object-detection/")
     parser.add_argument("--video_id", default="eKKdRy20HXI")
     parser.add_argument("--class_to_detect", default="car")
-    parser.add_argument("--frame_id", default=None)
-    parser.add_argument("--method", default="none", help="One of: none, default, custom")
+    parser.add_argument("--frame_start", default=None)
+    parser.add_argument("--frame_stop", default=None)
+    parser.add_argument("--method", default="tubelet", help="One of: none, proposals, default, tubelet")
     args = parser.parse_args()
 
     args.working_dir = Path(args.working_dir)
+    args.frame_start = int(args.frame_start)
+    args.frame_stop = int(args.frame_stop)
 
     if args.action == "preprocess_video":
         preprocess_video(args)
