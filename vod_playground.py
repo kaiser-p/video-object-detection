@@ -5,16 +5,14 @@ import cv2
 import tqdm
 import subprocess
 import pickle
-import itertools
 from pathlib import Path
 import numpy as np
-import copy
 
 import torch
 import detectron2
 from detectron2.engine import DefaultPredictor
 from detectron2.config import get_cfg
-from detectron2.utils.visualizer import Visualizer, ColorMode, GenericMask, _create_text_labels
+from detectron2.utils.visualizer import Visualizer, GenericMask, _create_text_labels
 from detectron2.data import MetadataCatalog
 from detectron2.structures import Instances, Boxes, pairwise_iou
 
@@ -100,26 +98,13 @@ def display_frame(args):
     cv2.imshow("image", v.get_image()[:, :, ::-1])
     cv2.waitKey(0)
 
-"""
-Problems:
- - Frame 0283-0286
-    - Tubelet disappears for one frame (IoU too small?)
-        - Box CoM prediction?
-    - Tubelet changes color (what happened here?)
-        - Unreasonable, this should not happen
-    - Small sub-tubelet begins to live and is then continued
-        - Can we do anything here?
-        
- - Display tubelet index
- - Display anticipated CoM movement
-"""
-
 
 class Tubelet:
-    def __init__(self, start_index, proposal_instance, iou_threshold=0.5, num_skippable_frames=5):
+    def __init__(self, start_index, proposal_instance, iou_threshold=0.6, num_skippable_frames=7):
         self.frame_ids = [start_index]
         self.last_key_instance_index = [0]
         self.proposal_instances = [proposal_instance]
+        self.proposal_instances_ious = [0]
         self.projected_proposal_instances = [proposal_instance]
         self.iou_threshold = iou_threshold
         self.num_skippable_frames = num_skippable_frames
@@ -157,38 +142,30 @@ class Tubelet:
         return projected_instance
 
     def extend(self, frame_index, proposal_instances):
-        for i in range(len(proposal_instances)):
-            proposal_instance = proposal_instances[i]
-            last_index = self.frame_ids[-1]
-            if frame_index - last_index > self.num_skippable_frames:
-                # This tubelet died
-                return
-            if last_index == frame_index:
-                # We already have a candidate for a continuation of this tubelet
-                # See if this one fits as well and then decide for the one with the highest score
-                cand_instance = self.proposal_instances[-1]
-                last_instance_index = -2
-                while self.proposal_instances[last_instance_index] is None and last_instance_index > -len(self.proposal_instances):
-                    last_instance_index -= 1
-                last_instance = self.proposal_instances[last_instance_index]
-                projected_last_instance = self.project_proposal_instance(frame_index)
-                iou = max(pairwise_iou(last_instance.pred_boxes, proposal_instance.pred_boxes), pairwise_iou(projected_last_instance.pred_boxes, proposal_instance.pred_boxes))
-                if iou > self.iou_threshold and proposal_instance.scores > cand_instance.scores:
-                    self.proposal_instances[-1] = proposal_instance
-            else:
-                # This is the first candidate to consider for extending the tubelet
-                last_key_instance_index = self.last_key_instance_index[-1]
-                last_instance = self.proposal_instances[-1]
-                projected_last_instance = self.project_proposal_instance(frame_index)
-                iou = max(pairwise_iou(last_instance.pred_boxes, proposal_instance.pred_boxes), pairwise_iou(projected_last_instance.pred_boxes, proposal_instance.pred_boxes))
-                if iou > self.iou_threshold:
-                    for j in range(last_index+1, frame_index):
-                        self.frame_ids.append(j)
-                        self.proposal_instances.append(None)
-                        self.last_key_instance_index.append(last_key_instance_index)
-                    self.frame_ids.append(frame_index)
-                    self.proposal_instances.append(proposal_instance)
-                    self.last_key_instance_index.append(len(self.last_key_instance_index))
+        last_index = self.frame_ids[-1]
+        if frame_index - last_index > self.num_skippable_frames:
+            # This tubelet died
+            return
+
+        last_key_instance_index = self.last_key_instance_index[-1]
+        projected_last_instance = self.project_proposal_instance(frame_index)
+        iou_per_proposal = pairwise_iou(proposal_instances.pred_boxes, projected_last_instance.pred_boxes)
+        extension_candidate_proposal_index = int(iou_per_proposal.argmax())
+
+        if iou_per_proposal[extension_candidate_proposal_index] < self.iou_threshold:
+            # This tubelet will not be extended in this frame
+            return
+
+        for j in range(last_index + 1, frame_index):
+            self.frame_ids.append(j)
+            self.proposal_instances.append(None)
+            self.proposal_instances_ious.append(0)
+            self.last_key_instance_index.append(last_key_instance_index)
+
+        self.frame_ids.append(frame_index)
+        self.proposal_instances.append(proposal_instances[extension_candidate_proposal_index])
+        self.proposal_instances_ious.append(iou_per_proposal[extension_candidate_proposal_index])
+        self.last_key_instance_index.append(len(self.last_key_instance_index))
 
     def collides_with(self, frame_index, proposal_instance):
         last_index = self.frame_ids[-1]
@@ -232,7 +209,7 @@ class Tubelet:
 
 
 
-def generate_tubelets(args, proposals_dict, threshold=0.6, start_frame=0):
+def generate_tubelets(args, proposals_dict, threshold=0.6, start_frame=0, class_index_to_detect=0):
     if args.method == "none":
         return proposals_dict
     elif args.method == "default":
@@ -245,11 +222,10 @@ def generate_tubelets(args, proposals_dict, threshold=0.6, start_frame=0):
                 proposal_instances = proposals_dict[frame_path]["instances"]
                 for tubelet in tubelets:
                     tubelet.extend(i+start_frame, proposal_instances)
-                key_proposal_indices = torch.nonzero(proposal_instances.scores > threshold)
+                key_proposal_indices = torch.nonzero((proposal_instances.scores > threshold) & (proposal_instances.pred_classes == class_index_to_detect))
                 for key_proposal_index in key_proposal_indices:
-                    key_proposal_instance = proposal_instances[key_proposal_index]
-                    if not any(t.collides_with(i+start_frame, key_proposal_instance) for t in tubelets):
-                        tubelets.append(Tubelet(i+start_frame, key_proposal_instance))
+                    if not any(t.collides_with(i+start_frame, proposal_instances[key_proposal_index]) for t in tubelets):
+                        tubelets.append(Tubelet(i+start_frame, proposal_instances[key_proposal_index]))
         print(f"Tubelet statistics:")
         print(f"    - Overall: {len(tubelets)}, avergae length: {sum(len(t) for t in tubelets) / len(tubelets) if tubelets else 0}")
         return tubelets
@@ -317,10 +293,18 @@ def render_video(args):
                 continue
             with proposals_path.open("rb") as f_in:
                 proposals = pickle.load(f_in)
-            proposals_dict[frame_path] = restrict_predictions(cfg, proposals, {args.class_to_detect})
+
+            proposals_dict[frame_path] = proposals
 
     print(f"Generating tubelets for {args.video_id}")
-    tubelets = generate_tubelets(args, proposals_dict, start_frame=args.frame_start if args.frame_start is not None else 0)
+    classes = MetadataCatalog.get(cfg.DATASETS.TRAIN[0]).thing_classes
+    class_index_to_detect = classes.index(args.class_to_detect)
+    tubelets = generate_tubelets(
+        args,
+        proposals_dict,
+        start_frame=args.frame_start if args.frame_start is not None else 0,
+        class_index_to_detect=class_index_to_detect
+    )
 
     print(f"Rendering frames for {args.video_id}.")
     with tqdm.tqdm(total=len(frame_list)) as pbar:
