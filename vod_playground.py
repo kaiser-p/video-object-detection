@@ -8,6 +8,7 @@ import pickle
 import itertools
 from pathlib import Path
 import numpy as np
+import copy
 
 import torch
 import detectron2
@@ -99,13 +100,61 @@ def display_frame(args):
     cv2.imshow("image", v.get_image()[:, :, ::-1])
     cv2.waitKey(0)
 
+"""
+Problems:
+ - Frame 0283-0286
+    - Tubelet disappears for one frame (IoU too small?)
+        - Box CoM prediction?
+    - Tubelet changes color (what happened here?)
+        - Unreasonable, this should not happen
+    - Small sub-tubelet begins to live and is then continued
+        - Can we do anything here?
+        
+ - Display tubelet index
+ - Display anticipated CoM movement
+"""
+
 
 class Tubelet:
-    def __init__(self, start_index, proposal_instance, iou_threshold=0.5, num_skippable_frames=3):
+    def __init__(self, start_index, proposal_instance, iou_threshold=0.5, num_skippable_frames=5):
         self.frame_ids = [start_index]
+        self.last_key_instance_index = [0]
         self.proposal_instances = [proposal_instance]
+        self.projected_proposal_instances = [proposal_instance]
         self.iou_threshold = iou_threshold
         self.num_skippable_frames = num_skippable_frames
+
+    def project_proposal_instance(self, frame_index):
+        if len(self.proposal_instances) == 1:
+            # We consider the first frame, there is nothing to project here
+            return self.proposal_instances[0]
+
+        instance_index_current = self.last_key_instance_index[-1]
+        instance_index_before = self.last_key_instance_index[-2]
+        frame_index_current = self.frame_ids[instance_index_current]
+
+        if frame_index == frame_index_current:
+            # We are replacing the most recent proposal instance
+            if len(self.proposal_instances) < 3:
+                instance_index_current = self.last_key_instance_index[-2]
+                return self.proposal_instances[instance_index_current]
+            else:
+                instance_index_current = self.last_key_instance_index[-2]
+                instance_index_before = self.last_key_instance_index[-3]
+                frame_index_current = self.frame_ids[instance_index_current]
+
+        instance_current = self.proposal_instances[instance_index_current]
+        instance_before = self.proposal_instances[instance_index_before]
+
+        centers_current = instance_current.pred_boxes.get_centers()
+        centers_before = instance_before.pred_boxes.get_centers()
+        centers_delta = (centers_current - centers_before) / (instance_index_current - instance_index_before) * (frame_index - frame_index_current)
+
+        projected_instance = Instances(instance_current.image_size)
+        projected_instance.pred_boxes = Boxes(instance_current.pred_boxes.tensor + centers_delta.repeat(1, 2))
+        projected_instance.scores = instance_current.scores
+        projected_instance.pred_classes = instance_current.pred_classes
+        return projected_instance
 
     def extend(self, frame_index, proposal_instances):
         for i in range(len(proposal_instances)):
@@ -122,19 +171,24 @@ class Tubelet:
                 while self.proposal_instances[last_instance_index] is None and last_instance_index > -len(self.proposal_instances):
                     last_instance_index -= 1
                 last_instance = self.proposal_instances[last_instance_index]
-                iou = pairwise_iou(last_instance.pred_boxes, proposal_instance.pred_boxes)
+                projected_last_instance = self.project_proposal_instance(frame_index)
+                iou = max(pairwise_iou(last_instance.pred_boxes, proposal_instance.pred_boxes), pairwise_iou(projected_last_instance.pred_boxes, proposal_instance.pred_boxes))
                 if iou > self.iou_threshold and proposal_instance.scores > cand_instance.scores:
                     self.proposal_instances[-1] = proposal_instance
             else:
                 # This is the first candidate to consider for extending the tubelet
+                last_key_instance_index = self.last_key_instance_index[-1]
                 last_instance = self.proposal_instances[-1]
-                iou = pairwise_iou(last_instance.pred_boxes, proposal_instance.pred_boxes)
+                projected_last_instance = self.project_proposal_instance(frame_index)
+                iou = max(pairwise_iou(last_instance.pred_boxes, proposal_instance.pred_boxes), pairwise_iou(projected_last_instance.pred_boxes, proposal_instance.pred_boxes))
                 if iou > self.iou_threshold:
-                    for i in range(last_index, frame_index):
-                        self.frame_ids.append(i)
+                    for j in range(last_index+1, frame_index):
+                        self.frame_ids.append(j)
                         self.proposal_instances.append(None)
+                        self.last_key_instance_index.append(last_key_instance_index)
                     self.frame_ids.append(frame_index)
                     self.proposal_instances.append(proposal_instance)
+                    self.last_key_instance_index.append(len(self.last_key_instance_index))
 
     def collides_with(self, frame_index, proposal_instance):
         last_index = self.frame_ids[-1]
