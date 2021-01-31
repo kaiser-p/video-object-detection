@@ -65,7 +65,7 @@ def preprocess_video(args):
                 continue
 
             frame = cv2.imread(str(frame_path))
-            proposals = generate_poposals(frame, model)
+            proposals = generate_poposals([frame], model)[0]
             with proposal_path.open("wb") as f_out:
                 pickle.dump(proposals, f_out)
 
@@ -100,7 +100,7 @@ def display_frame(args):
 
 
 class Tubelet:
-    def __init__(self, start_index, proposal_instance, iou_threshold=0.6, num_skippable_frames=7):
+    def __init__(self, start_index, proposal_instance, iou_threshold=0.6, num_skippable_frames=7, extend_class_only=True, class_to_detect=0):
         self.frame_ids = [start_index]
         self.last_key_instance_index = [0]
         self.proposal_instances = [proposal_instance]
@@ -108,6 +108,8 @@ class Tubelet:
         self.projected_proposal_instances = [proposal_instance]
         self.iou_threshold = iou_threshold
         self.num_skippable_frames = num_skippable_frames
+        self.extend_class_only = extend_class_only
+        self.class_to_detect = class_to_detect
 
     def project_proposal_instance(self, frame_index):
         if len(self.proposal_instances) == 1:
@@ -150,6 +152,12 @@ class Tubelet:
         last_key_instance_index = self.last_key_instance_index[-1]
         projected_last_instance = self.project_proposal_instance(frame_index)
         iou_per_proposal = pairwise_iou(proposal_instances.pred_boxes, projected_last_instance.pred_boxes)
+
+        if self.extend_class_only:
+            # Ignore all proposals of different classes
+            class_proposals = (proposal_instances.pred_classes != self.class_to_detect)
+            iou_per_proposal[class_proposals] = 0
+
         extension_candidate_proposal_index = int(iou_per_proposal.argmax())
 
         if iou_per_proposal[extension_candidate_proposal_index] < self.iou_threshold:
@@ -225,7 +233,11 @@ def generate_tubelets(args, proposals_dict, threshold=0.6, start_frame=0, class_
                 key_proposal_indices = torch.nonzero((proposal_instances.scores > threshold) & (proposal_instances.pred_classes == class_index_to_detect))
                 for key_proposal_index in key_proposal_indices:
                     if not any(t.collides_with(i+start_frame, proposal_instances[key_proposal_index]) for t in tubelets):
-                        tubelets.append(Tubelet(i+start_frame, proposal_instances[key_proposal_index]))
+                        tubelets.append(Tubelet(
+                            start_index = i+start_frame,
+                            proposal_instance = proposal_instances[key_proposal_index],
+                            class_to_detect = class_index_to_detect
+                        ))
         print(f"Tubelet statistics:")
         print(f"    - Overall: {len(tubelets)}, avergae length: {sum(len(t) for t in tubelets) / len(tubelets) if tubelets else 0}")
         return tubelets
@@ -401,10 +413,12 @@ def inference_image(image, model, score_threshold=0.01):
     return {"instances": result}, proposal_class_predictions, surviving_boxes[0], surviving_class_predictions
 
 
-def generate_poposals(image, model, score_threshold=0.01):
-    height, width = image.shape[:2]
-    image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))
-    inputs = [{"image": image, "height": height, "width": width}]
+def generate_poposals(images, model, score_threshold=0.01):
+    inputs = [{
+        "image": torch.as_tensor(image.astype("float32").transpose(2, 0, 1)),
+        "height": image.shape[0],
+        "width": image.shape[1]
+    } for image in images]
 
     with torch.no_grad():
         images = model.preprocess_image(inputs)
@@ -415,33 +429,34 @@ def generate_poposals(image, model, score_threshold=0.01):
         box_features = model.roi_heads.box_pooler(features_, [x.proposal_boxes for x in proposals])
         box_features = model.roi_heads.box_head(box_features)
         proposals_scores, proposals_deltas = model.roi_heads.box_predictor(box_features)
-        proposal_class_predictions = proposals_scores.softmax(-1)
 
-        boxes = model.roi_heads.box_predictor.predict_boxes((proposals_scores, proposals_deltas), proposals)
+        boxes_tensors = model.roi_heads.box_predictor.predict_boxes((proposals_scores, proposals_deltas), proposals)
         scores = model.roi_heads.box_predictor.predict_probs((proposals_scores, proposals_deltas), proposals)
 
-        scores = scores[0][:, :-1]
+        result = []
+        for i in range(len(inputs)):
+            image_size = proposals[i].image_size
+            num_bbox_reg_classes = boxes_tensors[i].shape[1] // 4
+            boxes = Boxes(boxes_tensors[i].reshape(-1, 4))
+            boxes.clip(image_size)
+            boxes = boxes.tensor.view(-1, num_bbox_reg_classes, 4)
 
-        image_size = proposals[0].image_size
-        num_bbox_reg_classes = boxes[0].shape[1] // 4
-        boxes = Boxes(boxes[0].reshape(-1, 4))
-        boxes.clip(image_size)
-        boxes = boxes.tensor.view(-1, num_bbox_reg_classes, 4)
+            img_scores = scores[i][:, :-1]
+            max_scores, pred_classes = torch.max(img_scores, dim=1)
+            keep_mask = max_scores > score_threshold
+            filtered_scores = img_scores[keep_mask, :]
+            filtered_max_scores = max_scores[keep_mask]
+            filtered_pred_classes = pred_classes[keep_mask]
+            boxes = boxes[keep_mask, filtered_pred_classes, :]
 
-        filter_mask = scores > score_threshold
-        filter_inds = filter_mask.nonzero()
-        if num_bbox_reg_classes == 1:
-            boxes = boxes[filter_inds[:, 0], 0]
-        else:
-            boxes = boxes[filter_mask]
-        scores = scores[filter_mask]
+            result_instance = Instances(image_size)
+            result_instance.pred_boxes = Boxes(boxes)
+            result_instance.scores = filtered_max_scores
+            result_instance.pred_classes = filtered_pred_classes
+            result_instance.class_distributions = filtered_scores
+            result.append(result_instance)
 
-        result = Instances(image_size)
-        result.pred_boxes = Boxes(boxes)
-        result.scores = scores
-        result.pred_classes = filter_inds[:, 1]
-
-    return {"instances": result, "proposal_class_predictions": proposal_class_predictions}
+    return result
 
 
 def load_model(config_only=False):
@@ -519,8 +534,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     args.working_dir = Path(args.working_dir)
-    args.frame_start = int(args.frame_start)
-    args.frame_stop = int(args.frame_stop)
+    args.frame_start = int(args.frame_start) if args.frame_start is not None else None
+    args.frame_stop = int(args.frame_stop) if args.frame_start is not None else None
 
     if args.action == "preprocess_video":
         preprocess_video(args)
