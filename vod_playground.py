@@ -5,6 +5,7 @@ import cv2
 import tqdm
 import subprocess
 import pickle
+import time
 from pathlib import Path
 import numpy as np
 
@@ -17,7 +18,7 @@ from detectron2.data import MetadataCatalog
 from detectron2.structures import Instances, Boxes, pairwise_iou
 
 
-def preprocess_video(args):
+def preprocess_video(args, batch_size=1):
     yt_url = f"https://www.youtube.com/watch?v={args.video_id}"
     filename = f"video_{args.video_id}"
     video_file_path = args.working_dir / f"{filename}.mp4"
@@ -58,16 +59,26 @@ def preprocess_video(args):
         proposals_dir.mkdir(parents=False, exist_ok=False)
     frame_list = sorted(frames_dir.glob(f"frame_*.png"))
     with tqdm.tqdm(total=len(frame_list)) as pbar:
+        batch_images = []
+        batch_paths = []
         for frame_path in frame_list:
             pbar.update(1)
             proposal_path = proposals_dir / frame_path.with_suffix(".pickle").name
             if proposal_path.exists():
                 continue
 
-            frame = cv2.imread(str(frame_path))
-            proposals = generate_poposals([frame], model)[0]
-            with proposal_path.open("wb") as f_out:
-                pickle.dump(proposals, f_out)
+            batch_images.append(cv2.imread(str(frame_path)))
+            batch_paths.append(proposal_path)
+
+            if len(batch_images) == batch_size or frame_path == frame_list[-1]:
+                start_time = time.time()
+                batch_proposals = generate_poposals(batch_images, model)
+                #print(f"Time for batch: {(time.time() - start_time) * 1000} ms for {len(batch_images)} images.")
+                for proposals, proposal_path in zip(batch_proposals, batch_paths):
+                    batch_images.clear()
+                    batch_paths.clear()
+                    with proposal_path.open("wb") as f_out:
+                        pickle.dump(proposals, f_out)
 
 
 def display_frame(args):
@@ -459,12 +470,16 @@ def generate_poposals(images, model, score_threshold=0.01):
     return result
 
 
-def load_model(config_only=False):
+def load_model(config_only=False, architecture="faster_rcnn_50"):
     cfg = get_cfg()
-    cfg.merge_from_file(Path(detectron2.__file__).resolve().parent / "model_zoo/configs/COCO-Detection/faster_rcnn_R_101_FPN_3x.yaml")
-    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5
-    cfg.MODEL.WEIGHTS = "detectron2://COCO-Detection/faster_rcnn_R_101_FPN_3x/137851257/model_final_f6e8b1.pkl"
     cfg.MODEL.DEVICE = "cpu"
+
+    if architecture == "faster_rcnn_101":
+        cfg.merge_from_file(Path(detectron2.__file__).resolve().parent / "model_zoo/configs/COCO-Detection/faster_rcnn_R_101_FPN_3x.yaml")
+        cfg.MODEL.WEIGHTS = "detectron2://COCO-Detection/faster_rcnn_R_101_FPN_3x/137851257/model_final_f6e8b1.pkl"
+    elif architecture == "faster_rcnn_50":
+        cfg.merge_from_file(Path(detectron2.__file__).resolve().parent / "model_zoo/configs/COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml")
+        cfg.MODEL.WEIGHTS = "detectron2://COCO-Detection/faster_rcnn_R_50_FPN_3x/137849458/model_final_280758.pkl"
 
     if config_only:
         return cfg, None
@@ -472,45 +487,6 @@ def load_model(config_only=False):
     print("Loading model.")
     predictor = DefaultPredictor(cfg)
     return cfg, predictor.model
-
-
-def detect_objects(args):
-    source_frames_dir = args.working_dir / f"frames_{args.video_id}"
-    target_frames_dir = args.working_dir / f"frames_{args.video_id}__default"
-
-    target_frames_dir.mkdir(exist_ok=True)
-
-    cfg = get_cfg()
-    cfg.merge_from_file(Path(detectron2.__file__).resolve().parent / "model_zoo/configs/COCO-Detection/faster_rcnn_R_101_FPN_3x.yaml")
-    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5
-    cfg.MODEL.WEIGHTS = "detectron2://COCO-Detection/faster_rcnn_R_101_FPN_3x/137851257/model_final_f6e8b1.pkl"
-    cfg.MODEL.DEVICE = "cpu"
-
-    print("Loading model.")
-    predictor = DefaultPredictor(cfg)
-
-    print("Starting to detect objects in frames using the default approach.")
-    if args.frame_id is None:
-        frame_list = sorted(source_frames_dir.glob("frame_*.png"))
-    else:
-        frame_list = [source_frames_dir / f"frame_{args.frame_id}.png"]
-    with tqdm.tqdm(total=len(frame_list)) as pbar:
-        for frame_path in frame_list:
-            pbar.update(1)
-            output_frame_path = target_frames_dir / frame_path.with_suffix(".json").name
-            if output_frame_path.exists():
-                continue
-
-            frame = cv2.imread(str(frame_path))
-            proposal_boxes, proposal_class_predictions, surviving_boxes, surviving_class_predictions = inference_image(frame, predictor.model)
-
-            proposal_boxes = restrict_predictions(cfg, proposal_boxes, {args.class_to_detect})
-
-            v = Visualizer(frame[:, :, ::-1], MetadataCatalog.get(cfg.DATASETS.TRAIN[0]), scale=1.2)
-            v = v.draw_instance_predictions(proposal_boxes["instances"])
-
-            cv2.imshow("image", v.get_image()[:, :, ::-1])
-            cv2.waitKey(0)
 
 
 def assemble_result(args):
@@ -543,8 +519,6 @@ if __name__ == "__main__":
         display_frame(args)
     elif args.action == "render_video":
         render_video(args)
-    elif args.action == "detect_objects":
-        detect_objects(args)
     elif args.action == "assemble_result":
         assemble_result(args)
     else:
