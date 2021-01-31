@@ -152,6 +152,7 @@ class Tubelet:
         projected_instance.pred_boxes = Boxes(instance_current.pred_boxes.tensor + centers_delta.repeat(1, 2))
         projected_instance.scores = instance_current.scores
         projected_instance.pred_classes = instance_current.pred_classes
+        projected_instance.class_distributions = instance_current.class_distributions
         return projected_instance
 
     def extend(self, frame_index, proposal_instances):
@@ -224,6 +225,7 @@ class Tubelet:
                 interpolated_instance.pred_boxes = Boxes(instance_before.pred_boxes.tensor + interpolation_factor * (instance_after.pred_boxes.tensor - instance_before.pred_boxes.tensor))
                 interpolated_instance.scores = torch.tensor([0])
                 interpolated_instance.pred_classes = instance_before.pred_classes
+                interpolated_instance.class_distributions = instance_before.class_distributions
                 return interpolated_instance
 
 
@@ -238,7 +240,7 @@ def generate_tubelets(args, proposals_dict, threshold=0.6, start_frame=0, class_
         with tqdm.tqdm(total=len(proposals_dict)) as pbar:
             for i, frame_path in enumerate(sorted(proposals_dict.keys())):
                 pbar.update(1)
-                proposal_instances = proposals_dict[frame_path]["instances"]
+                proposal_instances = proposals_dict[frame_path]
                 for tubelet in tubelets:
                     tubelet.extend(i+start_frame, proposal_instances)
                 key_proposal_indices = torch.nonzero((proposal_instances.scores > threshold) & (proposal_instances.pred_classes == class_index_to_detect))
@@ -371,7 +373,8 @@ def restrict_predictions(cfg, predictions, allowed_classes=None):
         image_size=predictions["instances"].image_size,
         pred_boxes=predictions["instances"].pred_boxes[instances_to_keep],
         scores=predictions["instances"].scores[instances_to_keep],
-        pred_classes=predictions["instances"].pred_classes[instances_to_keep]
+        pred_classes=predictions["instances"].pred_classes[instances_to_keep],
+        class_distributions=predictions["instances"].class_distributions[instances_to_keep]
     )}
 
 
