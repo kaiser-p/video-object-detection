@@ -81,35 +81,6 @@ def preprocess_video(args, batch_size=1):
                         pickle.dump(proposals, f_out)
 
 
-def display_frame(args):
-    if args.frame_id is None:
-        print("Please specify a frame to visualize")
-        return
-
-    cfg, _ = load_model(config_only=True)
-
-    proposals_dir = args.working_dir / f"proposals_{args.video_id}"
-    proposals_path = proposals_dir / f"frame_{int(args.frame_id):04d}.pickle"
-
-    frames_dir = args.working_dir / f"frames_{args.video_id}"
-    frame_path = frames_dir / f"frame_{int(args.frame_id):04d}.png"
-
-    print(f"Visualizing proposals for {args.video_id}.")
-    print(f"Loading proposals from {proposals_path}")
-
-    with proposals_path.open("rb") as f_in:
-        proposals = pickle.load(f_in)
-
-    proposals = restrict_predictions(cfg, proposals, {args.class_to_detect})
-
-    frame = cv2.imread(str(frame_path))
-    v = Visualizer(frame[:, :, ::-1], MetadataCatalog.get(cfg.DATASETS.TRAIN[0]), scale=1.2)
-    v = v.draw_instance_predictions(proposals["instances"])
-
-    cv2.imshow("image", v.get_image()[:, :, ::-1])
-    cv2.waitKey(0)
-
-
 class Tubelet:
     def __init__(self, start_index, proposal_instance, iou_threshold=0.6, num_skippable_frames=7, extend_class_only=True, class_to_detect=0):
         self.frame_ids = [start_index]
@@ -378,55 +349,6 @@ def restrict_predictions(cfg, predictions, allowed_classes=None):
     )}
 
 
-def inference_image(image, model, score_threshold=0.01):
-    height, width = image.shape[:2]
-    image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))
-    inputs = [{"image": image, "height": height, "width": width}]
-
-    with torch.no_grad():
-        images = model.preprocess_image(inputs)
-        features = model.backbone(images.tensor)
-        proposals, _ = model.proposal_generator(images, features, None)
-
-        features_ = [features[f] for f in model.roi_heads.box_in_features]
-        box_features = model.roi_heads.box_pooler(features_, [x.proposal_boxes for x in proposals])
-        box_features = model.roi_heads.box_head(box_features)  # features of all 1k candidates
-        proposals_scores, proposals_deltas = model.roi_heads.box_predictor(box_features)
-        proposal_class_predictions = proposals_scores.softmax(-1)
-
-        boxes = model.roi_heads.box_predictor.predict_boxes((proposals_scores, proposals_deltas), proposals)
-        scores = model.roi_heads.box_predictor.predict_probs((proposals_scores, proposals_deltas), proposals)
-
-        scores = scores[0][:, :-1]
-
-        image_size = proposals[0].image_size
-        num_bbox_reg_classes = boxes[0].shape[1] // 4
-        boxes = Boxes(boxes[0].reshape(-1, 4))
-        boxes.clip(image_size)
-        boxes = boxes.tensor.view(-1, num_bbox_reg_classes, 4)
-
-        filter_mask = scores > score_threshold
-        filter_inds = filter_mask.nonzero()
-        if num_bbox_reg_classes == 1:
-            boxes = boxes[filter_inds[:, 0], 0]
-        else:
-            boxes = boxes[filter_mask]
-        scores = scores[filter_mask]
-
-        result = Instances(image_size)
-        result.pred_boxes = Boxes(boxes)
-        result.scores = scores
-        result.pred_classes = filter_inds[:, 1]
-
-        pred_instances, pred_inds = model.roi_heads.box_predictor.inference((proposals_scores, proposals_deltas), proposals)
-        pred_instances = model.roi_heads.forward_with_given_boxes(features, pred_instances)
-        surviving_boxes = model._postprocess(pred_instances, inputs, images.image_sizes)
-        surviving_features = box_features[pred_inds]
-        surviving_class_predictions = proposal_class_predictions[pred_inds]
-
-    return {"instances": result}, proposal_class_predictions, surviving_boxes[0], surviving_class_predictions
-
-
 def generate_poposals(images, model, score_threshold=0.01):
     inputs = [{
         "image": torch.as_tensor(image.astype("float32").transpose(2, 0, 1)),
@@ -518,8 +440,6 @@ if __name__ == "__main__":
 
     if args.action == "preprocess_video":
         preprocess_video(args)
-    elif args.action == "display_frame":
-        display_frame(args)
     elif args.action == "render_video":
         render_video(args)
     elif args.action == "assemble_result":
