@@ -7,6 +7,7 @@ import subprocess
 import pickle
 import time
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
 import torch
@@ -273,6 +274,28 @@ def draw_instance_predictions(visualizer, instances):
     return visualizer.output
 
 
+def render_frame(prms):
+    frame_id, frame_path, tubelets, rendered_frames_dir, cfg = prms
+
+    rendered_frame_path = rendered_frames_dir / frame_path.name
+    if rendered_frame_path.exists():
+        return
+
+    instances = []
+    for tubelet_id, tubelet in enumerate(tubelets):
+        instance = tubelet.get_instance(frame_id)
+        if instance is not None:
+            instances.append((tubelet_id, instance))
+    #print(f"Frame #{frame_id}: {len(instances)} instances")
+
+    frame = cv2.imread(str(frame_path))
+    if instances:
+        v = Visualizer(frame[:, :, ::-1], MetadataCatalog.get(cfg.DATASETS.TRAIN[0]), scale=1.2)
+        v = draw_instance_predictions(v, instances)
+        cv2.imwrite(str(rendered_frame_path), v.get_image()[:, :, ::-1])
+    else:
+        cv2.imwrite(str(rendered_frame_path), frame)
+
 
 def render_video(args):
     cfg, _ = load_model(config_only=True)
@@ -314,34 +337,18 @@ def render_video(args):
         class_index_to_detect=class_index_to_detect
     )
 
-    print(f"Rendering frames for {args.video_id}.")
-    with tqdm.tqdm(total=len(frame_list)) as pbar:
-        for i, frame_path in enumerate(frame_list):
-            pbar.update(1)
-            frame_id = int(frame_path.name[frame_path.name.find("_")+1:frame_path.name.find(".")])
-            if args.frame_start is not None and frame_id < args.frame_start:
-                continue
-            if args.frame_stop is not None and frame_id > args.frame_stop:
-                continue
+    rendering_prms = []
+    for i, frame_path in enumerate(frame_list):
+        frame_id = int(frame_path.name[frame_path.name.find("_") + 1:frame_path.name.find(".")])
+        if args.frame_start is not None and frame_id < args.frame_start:
+            continue
+        if args.frame_stop is not None and frame_id > args.frame_stop:
+            continue
+        rendering_prms.append((i, frame_path, tubelets, rendered_frames_dir, cfg))
 
-            rendered_frame_path = rendered_frames_dir / frame_path.name
-            if rendered_frame_path.exists():
-                continue
-
-            instances = []
-            for tubelet_id, tubelet in enumerate(tubelets):
-                instance = tubelet.get_instance(frame_id)
-                if instance is not None:
-                    instances.append((tubelet_id, instance))
-            #print(f"Frame #{i}: {len(instances)} instances")
-
-            frame = cv2.imread(str(frame_path))
-            if instances:
-                v = Visualizer(frame[:, :, ::-1], MetadataCatalog.get(cfg.DATASETS.TRAIN[0]), scale=1.2)
-                v = draw_instance_predictions(v, instances)
-                cv2.imwrite(str(rendered_frame_path), v.get_image()[:, :, ::-1])
-            else:
-                cv2.imwrite(str(rendered_frame_path), frame)
+    print(f"Rendering {len(rendering_prms)} frames for {args.video_id}.")
+    with ThreadPoolExecutor(max_workers=30) as executor:
+        result = list(tqdm.tqdm(executor.map(render_frame, rendering_prms), total=len(rendering_prms)))
 
 
 def restrict_predictions(cfg, predictions, allowed_classes=None):
