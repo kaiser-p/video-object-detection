@@ -16,6 +16,7 @@ from detectron2.config import get_cfg
 from detectron2.utils.visualizer import Visualizer, GenericMask, _create_text_labels
 from detectron2.data import MetadataCatalog
 from detectron2.structures import Instances, Boxes, pairwise_iou
+from torchvision.ops import nms
 
 
 def preprocess_video(args, batch_size=1):
@@ -201,20 +202,29 @@ class Tubelet:
 
 
 
-def generate_tubelets(args, proposals_dict, threshold=0.6, start_frame=0, class_index_to_detect=0):
-    if args.method == "none":
-        return proposals_dict
-    elif args.method == "default":
-        return proposals_dict
-    elif args.method == "tubelet":
-        tubelets = []
-        with tqdm.tqdm(total=len(proposals_dict)) as pbar:
-            for i, frame_path in enumerate(sorted(proposals_dict.keys())):
-                pbar.update(1)
-                proposal_instances = proposals_dict[frame_path]
+def generate_tubelets(args, proposals_dict, score_threshold=0.6, start_frame=0, class_index_to_detect=0, iou_threshold=0.6):
+    tubelets = []
+    with tqdm.tqdm(total=len(proposals_dict)) as pbar:
+        for i, frame_path in enumerate(sorted(proposals_dict.keys())):
+            pbar.update(1)
+            proposal_instances = proposals_dict[frame_path]
+            if args.method in {"threshold", "nms"}:
+                surviving_instances = proposal_instances[proposal_instances.class_distributions[:, class_index_to_detect] > score_threshold]
+                if args.method == "frame_nms":
+                    surviving_indices = nms(surviving_instances.pred_boxes.tensor, surviving_instances.class_distributions[:, class_index_to_detect], iou_threshold)
+                    surviving_instances = surviving_instances[surviving_indices]
+
+                # Generate one tubelet for each proposal
+                for proposal_index in range(len(surviving_instances)):
+                    tubelets.append(Tubelet(
+                            start_index = i+start_frame,
+                            proposal_instance = surviving_instances[proposal_index],
+                            class_to_detect = class_index_to_detect
+                        ))
+            elif args.method == "tubelet":
                 for tubelet in tubelets:
                     tubelet.extend(i+start_frame, proposal_instances)
-                key_proposal_indices = torch.nonzero((proposal_instances.scores > threshold) & (proposal_instances.pred_classes == class_index_to_detect))
+                key_proposal_indices = torch.nonzero((proposal_instances.scores > score_threshold) & (proposal_instances.pred_classes == class_index_to_detect))
                 for key_proposal_index in key_proposal_indices:
                     if not any(t.collides_with(i+start_frame, proposal_instances[key_proposal_index]) for t in tubelets):
                         tubelets.append(Tubelet(
@@ -222,11 +232,13 @@ def generate_tubelets(args, proposals_dict, threshold=0.6, start_frame=0, class_
                             proposal_instance = proposal_instances[key_proposal_index],
                             class_to_detect = class_index_to_detect
                         ))
-        print(f"Tubelet statistics:")
-        print(f"    - Overall: {len(tubelets)}, avergae length: {sum(len(t) for t in tubelets) / len(tubelets) if tubelets else 0}")
-        return tubelets
-    else:
-        raise ValueError(f"Unknown method: {args.method}")
+            else:
+                raise ValueError(f"Unknown method: {args.method}")
+
+    print()
+    print(f"Tubelet statistics:")
+    print(f"    - Overall: {len(tubelets)}, avergae length: {sum(len(t) for t in tubelets) / len(tubelets) if tubelets else 0}")
+    return tubelets
 
 
 def draw_instance_predictions(visualizer, instances):
@@ -321,7 +333,7 @@ def render_video(args):
                 instance = tubelet.get_instance(frame_id)
                 if instance is not None:
                     instances.append((tubelet_id, instance))
-            print(f"Frame #{i}: {len(instances)} instances")
+            #print(f"Frame #{i}: {len(instances)} instances")
 
             frame = cv2.imread(str(frame_path))
             if instances:
@@ -431,7 +443,7 @@ if __name__ == "__main__":
     parser.add_argument("--class_to_detect", default="car")
     parser.add_argument("--frame_start", default=None)
     parser.add_argument("--frame_stop", default=None)
-    parser.add_argument("--method", default="tubelet", help="One of: none, proposals, default, tubelet")
+    parser.add_argument("--method", default="tubelet", help="One of: threshold, nms, tubelet")
     args = parser.parse_args()
 
     args.working_dir = Path(args.working_dir)
