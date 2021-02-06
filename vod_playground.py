@@ -84,12 +84,13 @@ def preprocess_video(args, batch_size=1):
 
 
 class Tubelet:
-    def __init__(self, start_index, proposal_instance, iou_threshold=0.6, num_skippable_frames=7, extend_class_only=True, class_to_detect=0):
+    def __init__(self, start_index, proposal_instance, iou_threshold=0.7, num_skippable_frames=7, extend_class_only=True, class_to_detect=0):
+        proposal_instance.generation_process = ["S"]
+
         self.frame_ids = [start_index]
         self.last_key_instance_index = [0]
         self.proposal_instances = [proposal_instance]
         self.proposal_instances_ious = [0]
-        self.projected_proposal_instances = [proposal_instance]
         self.iou_threshold = iou_threshold
         self.num_skippable_frames = num_skippable_frames
         self.extend_class_only = extend_class_only
@@ -128,7 +129,7 @@ class Tubelet:
         projected_instance.class_distributions = instance_current.class_distributions
         return projected_instance
 
-    def extend(self, frame_index, proposal_instances):
+    def extend_after(self, frame_index, proposal_instances):
         last_index = self.frame_ids[-1]
         if frame_index - last_index > self.num_skippable_frames:
             # This tubelet died
@@ -155,10 +156,40 @@ class Tubelet:
             self.proposal_instances_ious.append(0)
             self.last_key_instance_index.append(last_key_instance_index)
 
+        pi = proposal_instances[extension_candidate_proposal_index]
+        pi.generation_process = ["T+" if frame_index > 0 else "T-"]
+
         self.frame_ids.append(frame_index)
-        self.proposal_instances.append(proposal_instances[extension_candidate_proposal_index])
+        self.proposal_instances.append(pi)
         self.proposal_instances_ious.append(iou_per_proposal[extension_candidate_proposal_index])
         self.last_key_instance_index.append(len(self.last_key_instance_index))
+
+    def extend_before(self, frame_index, proposal_instances):
+        def restore_last_key_instance_index(proposal_instances):
+            result = []
+            last_key_index = 0
+            for i in range(len(proposal_instances)):
+                if proposal_instances[i] is not None:
+                    last_key_index = i
+                result.append(last_key_index)
+            return result
+
+        if frame_index >= self.frame_ids[0]:
+            return
+
+        # We simply turn around the time and use extend_after
+        self.proposal_instances.reverse()
+        self.proposal_instances_ious.reverse()
+        self.frame_ids = list(-fid for fid in reversed(self.frame_ids))
+        self.last_key_instance_index = restore_last_key_instance_index(self.proposal_instances)
+
+        self.extend_after(-frame_index, proposal_instances)
+
+        self.proposal_instances.reverse()
+        self.proposal_instances_ious.reverse()
+        self.frame_ids = list(-fid for fid in reversed(self.frame_ids))
+        self.last_key_instance_index = restore_last_key_instance_index(self.proposal_instances)
+
 
     def collides_with(self, frame_index, proposal_instance):
         last_index = self.frame_ids[-1]
@@ -199,19 +230,20 @@ class Tubelet:
                 interpolated_instance.scores = torch.tensor([0])
                 interpolated_instance.pred_classes = instance_before.pred_classes
                 interpolated_instance.class_distributions = instance_before.class_distributions
+                interpolated_instance.generation_process = ["I"]
                 return interpolated_instance
 
 
 
-def generate_tubelets(args, proposals_dict, score_threshold=0.6, start_frame=0, class_index_to_detect=0, iou_threshold=0.6):
+def generate_tubelets(args, proposals_dict, score_threshold=0.5, start_frame=0, class_index_to_detect=0, iou_threshold=0.6):
     tubelets = []
-    with tqdm.tqdm(total=len(proposals_dict)) as pbar:
-        for i, frame_path in enumerate(sorted(proposals_dict.keys())):
-            pbar.update(1)
-            proposal_instances = proposals_dict[frame_path]
-            if args.method in {"threshold", "nms"}:
+    if args.method in {"threshold", "nms"}:
+        with tqdm.tqdm(total=len(proposals_dict)) as pbar:
+            for i, frame_path in enumerate(sorted(proposals_dict.keys())):
+                pbar.update(1)
+                proposal_instances = proposals_dict[frame_path]
                 surviving_instances = proposal_instances[proposal_instances.class_distributions[:, class_index_to_detect] > score_threshold]
-                if args.method == "frame_nms":
+                if args.method == "nms":
                     surviving_indices = nms(surviving_instances.pred_boxes.tensor, surviving_instances.class_distributions[:, class_index_to_detect], iou_threshold)
                     surviving_instances = surviving_instances[surviving_indices]
 
@@ -222,19 +254,32 @@ def generate_tubelets(args, proposals_dict, score_threshold=0.6, start_frame=0, 
                             proposal_instance = surviving_instances[proposal_index],
                             class_to_detect = class_index_to_detect
                         ))
-            elif args.method == "tubelet":
+    elif args.method == "tubelet":
+        print(f"Tubelet forward pass through {len(proposals_dict)} frames ...")
+        with tqdm.tqdm(total=len(proposals_dict)) as pbar:
+            for i, frame_path in enumerate(sorted(proposals_dict.keys())):
+                pbar.update(1)
+                proposal_instances = proposals_dict[frame_path]
                 for tubelet in tubelets:
-                    tubelet.extend(i+start_frame, proposal_instances)
+                    tubelet.extend_after(i+start_frame, proposal_instances)
                 key_proposal_indices = torch.nonzero((proposal_instances.scores > score_threshold) & (proposal_instances.pred_classes == class_index_to_detect))
                 for key_proposal_index in key_proposal_indices:
                     if not any(t.collides_with(i+start_frame, proposal_instances[key_proposal_index]) for t in tubelets):
                         tubelets.append(Tubelet(
                             start_index = i+start_frame,
                             proposal_instance = proposal_instances[key_proposal_index],
-                            class_to_detect = class_index_to_detect
+                            class_to_detect = class_index_to_detect,
+                            iou_threshold = iou_threshold
                         ))
-            else:
-                raise ValueError(f"Unknown method: {args.method}")
+        print(f"Tubelet backward pass through {len(proposals_dict)} frames ...")
+        with tqdm.tqdm(total=len(proposals_dict)) as pbar:
+            for i, frame_path in enumerate(reversed(sorted(proposals_dict.keys()))):
+                pbar.update(1)
+                proposal_instances = proposals_dict[frame_path]
+                for tubelet in tubelets:
+                    tubelet.extend_before(start_frame + len(proposals_dict) - i - 1, proposal_instances)
+    else:
+        raise ValueError(f"Unknown method: {args.method}")
 
     print()
     print(f"Tubelet statistics:")
@@ -255,6 +300,11 @@ def draw_instance_predictions(visualizer, instances):
     classes = predictions.pred_classes if predictions.has("pred_classes") else None
     labels = _create_text_labels(classes, scores, visualizer.metadata.get("thing_classes", None))
     keypoints = predictions.pred_keypoints if predictions.has("pred_keypoints") else None
+    generation_processes = predictions.generation_process if predictions.has("generation_process") else None
+
+    if generation_processes is not None:
+        for i in range(len(labels)):
+            labels[i] = f"{labels[i]} ({generation_processes[i]})"
 
     if predictions.has("pred_masks"):
         masks = np.asarray(predictions.pred_masks)
@@ -433,13 +483,15 @@ def load_model(config_only=False, architecture="faster_rcnn_50"):
     return cfg, predictor.model
 
 
-def assemble_result(args):
-    source_frames_dir = args.working_dir / f"rendered_frames_{args.video_id}__custom"
-    subprocess.run([
-        "ffmpeg", "-r", "25", "-start_number", "1500", "-i",
-        str(source_frames_dir / "frame_%04d.png"),
-        "-y", str(args.working_dir / f"video_{args.video_id}__custom.mp4")
-    ])
+def assemble_results(args):
+    for method in {"threshold", "nms", "tubelet"}:
+        source_path = args.working_dir / f"rendered_frames_{args.video_id}__{method}" / "frame_%04d.png"
+        target_path = args.working_dir / f"video_{args.video_id}__{method}.mp4"
+        if target_path.exists():
+            print(f"Target video {target_path} already exists")
+        else:
+            print(f"Assembling video {target_path}")
+            subprocess.run(["ffmpeg", "-r", "25", "-start_number", "1500", "-i", str(source_path), "-y", str(target_path)])
 
 
 if __name__ == "__main__":
@@ -461,7 +513,7 @@ if __name__ == "__main__":
         preprocess_video(args)
     elif args.action == "render_video":
         render_video(args)
-    elif args.action == "assemble_result":
-        assemble_result(args)
+    elif args.action == "assemble_results":
+        assemble_results(args)
     else:
         raise NotImplementedError(f"Unknown action: {args.action}")
