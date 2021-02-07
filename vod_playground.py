@@ -22,8 +22,9 @@ from torchvision.ops import nms
 
 def preprocess_video(args, batch_size=1):
     yt_url = f"https://www.youtube.com/watch?v={args.video_id}"
-    filename = f"video_{args.video_id}"
-    video_file_path = args.working_dir / f"{filename}.mp4"
+    filename = f"video"
+    video_working_dir = args.working_dir / args.video_id
+    video_file_path = video_working_dir / f"video.mp4"
 
     # Download video
     if video_file_path.exists():
@@ -31,40 +32,47 @@ def preprocess_video(args, batch_size=1):
     else:
         print(f"Downloading {yt_url} to {video_file_path}")
         video = pytube.YouTube(yt_url, on_progress_callback=pytube.cli.on_progress)
-        video.streams.filter(res="720p").first().download(output_path=args.working_dir, filename=filename)
+        video.streams.filter(res="720p").first().download(output_path=video_working_dir, filename=filename)
         print()
 
     # Extract frames
-    frames_dir = args.working_dir / f"frames_{args.video_id}"
+    frames_dir = video_working_dir / f"frames"
     if frames_dir.exists():
         print(f"Frames for {args.video_id} already extracted.")
     else:
         print(f"Extracting frames for {args.video_id} to {frames_dir}")
-        frames_dir.mkdir(parents=False, exist_ok=False)
+        frames_dir.mkdir(parents=True, exist_ok=False)
         vidcap = cv2.VideoCapture(str(video_file_path))
         num_frames = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
         count = 0
         with tqdm.tqdm(total=num_frames) as pbar:
             while (frame_info := vidcap.read())[0]:
-                frame_file_path = frames_dir / f"frame_{count:04d}.png"
+                frame_file_path = frames_dir / f"frame_{count:04d}.jpg"
                 cv2.imwrite(str(frame_file_path), frame_info[1])
                 count += 1
                 pbar.update(1)
         print(f"Extracted {count+1} frames.")
 
     # Generate frame-based object proposals
-    proposals_dir = args.working_dir / f"proposals_{args.video_id}"
+    proposals_dir = video_working_dir / f"proposals"
     print(f"Extracting proposals for {args.video_id} to {frames_dir}")
     cfg, model = load_model()
 
     if not proposals_dir.exists():
         proposals_dir.mkdir(parents=False, exist_ok=False)
-    frame_list = sorted(frames_dir.glob(f"frame_*.png"))
+    frame_list = sorted(frames_dir.glob(f"frame_*.jpg"))
     with tqdm.tqdm(total=len(frame_list)) as pbar:
         batch_images = []
         batch_paths = []
         for frame_path in frame_list:
             pbar.update(1)
+
+            frame_id = int(frame_path.name[frame_path.name.find("_")+1:frame_path.name.find(".")])
+            if args.frame_start is not None and frame_id < args.frame_start:
+                continue
+            if args.frame_stop is not None and frame_id > args.frame_stop:
+                continue
+
             proposal_path = proposals_dir / frame_path.with_suffix(".pickle").name
             if proposal_path.exists():
                 continue
@@ -73,9 +81,7 @@ def preprocess_video(args, batch_size=1):
             batch_paths.append(proposal_path)
 
             if len(batch_images) == batch_size or frame_path == frame_list[-1]:
-                start_time = time.time()
                 batch_proposals = generate_poposals(batch_images, model)
-                #print(f"Time for batch: {(time.time() - start_time) * 1000} ms for {len(batch_images)} images.")
                 for proposals, proposal_path in zip(batch_proposals, batch_paths):
                     batch_images.clear()
                     batch_paths.clear()
@@ -273,7 +279,7 @@ def generate_tubelets(
         class_index_to_detect=0,
         iou_threshold=0.5,
         extend_class_only=False,
-        num_skippable_frames=10,
+        num_skippable_frames=5,
         max_dimension_change_ratio=0.1
 ):
     tubelets = []
@@ -319,7 +325,7 @@ def generate_tubelets(
                             iou_threshold = iou_threshold,
                             extend_class_only = extend_class_only,
                             num_skippable_frames = num_skippable_frames,
-                            max_dimension_change_ratio=max_dimension_change_ratio
+                            max_dimension_change_ratio = max_dimension_change_ratio
                         ))
         print(f"Tubelet backward pass through {len(proposals_dict)} frames ...")
         with tqdm.tqdm(total=len(proposals_dict_after_nms)) as pbar:
@@ -405,14 +411,14 @@ def render_frame(prms):
 def render_video(args):
     cfg, _ = load_model(config_only=True)
 
-    proposals_dir = args.working_dir / f"proposals_{args.video_id}"
-    frames_dir = args.working_dir / f"frames_{args.video_id}"
-    rendered_frames_dir = args.working_dir / f"rendered_frames_{args.video_id}__{args.method}"
+    proposals_dir = args.working_dir / args.video_id / "proposals"
+    frames_dir = args.working_dir / args.video_id / "frames"
+    rendered_frames_dir = args.working_dir / args.video_id / f"rendered_frames__{args.method}"
 
     if not rendered_frames_dir.exists():
         rendered_frames_dir.mkdir()
 
-    frame_list = sorted(frames_dir.glob("frame_*.png"))
+    frame_list = sorted(frames_dir.glob("frame_*.jpg"))
     print(f"Loading {len(frame_list)} frames and proposals")
     proposals_dict = {}
     with tqdm.tqdm(total=len(frame_list)) as pbar:
@@ -473,7 +479,7 @@ def restrict_predictions(cfg, predictions, allowed_classes=None):
     )}
 
 
-def generate_poposals(images, model, score_threshold=0.01):
+def generate_poposals(images, model, score_threshold=0):
     inputs = [{
         "image": torch.as_tensor(image.astype("float32").transpose(2, 0, 1)),
         "height": image.shape[0],
@@ -503,6 +509,7 @@ def generate_poposals(images, model, score_threshold=0.01):
 
             img_scores = scores[i][:, :-1]
             max_scores, pred_classes = torch.max(img_scores, dim=1)
+
             keep_mask = max_scores > score_threshold
             filtered_scores = img_scores[keep_mask, :]
             filtered_max_scores = max_scores[keep_mask]
@@ -540,8 +547,8 @@ def load_model(config_only=False, architecture="faster_rcnn_50"):
 
 def assemble_results(args):
     for method in {"threshold", "nms", "tubelet"}:
-        source_path = args.working_dir / f"rendered_frames_{args.video_id}__{method}" / "frame_%04d.png"
-        target_path = args.working_dir / f"video_{args.video_id}__{method}.mp4"
+        source_path = args.working_dir / args.video_id / f"rendered_frames__{method}" / "frame_%04d.jpg"
+        target_path = args.working_dir / args.video_id / f"video__{method}.mp4"
         if target_path.exists():
             print(f"Target video {target_path} already exists")
         else:
