@@ -16,7 +16,8 @@ from detectron2.engine import DefaultPredictor
 from detectron2.config import get_cfg
 from detectron2.utils.visualizer import Visualizer, GenericMask, _create_text_labels
 from detectron2.data import MetadataCatalog
-from detectron2.structures import Instances, Boxes, pairwise_iou
+from detectron2.structures import Instances
+from detectron2.structures.boxes import Boxes, pairwise_iou, pairwise_intersection
 from torchvision.ops import nms
 
 
@@ -147,7 +148,7 @@ class Tubelet:
 
     def extend_after(self, frame_index, proposal_instances):
         if self.is_dead(frame_index):
-            return
+            return False
 
         last_key_instance_index = self.last_key_instance_index[-1]
         if self.perform_projection:
@@ -169,7 +170,7 @@ class Tubelet:
             proposal_instances = proposal_instances[selection_mask]
 
         if len(proposal_instances) == 0:
-            return
+            return False
 
         iou_per_proposal = pairwise_iou(proposal_instances.pred_boxes, projected_last_instance.pred_boxes)
 
@@ -183,7 +184,7 @@ class Tubelet:
         last_index = self.frame_ids[-1]
         if iou_per_proposal[extension_candidate_proposal_index] < self.iou_threshold:
             # This tubelet will not be extended in this frame
-            return
+            return False
 
         for j in range(last_index + 1, frame_index):
             self.frame_ids.append(j)
@@ -200,6 +201,7 @@ class Tubelet:
         self.proposal_instances_ious.append(iou_per_proposal[extension_candidate_proposal_index])
         self.last_key_instance_index.append(len(self.last_key_instance_index))
         self.projected_proposal_instances.append(projected_last_instance)
+        return True
 
     def extend_before(self, frame_index, proposal_instances):
         def restore_last_key_instance_index(proposal_instances):
@@ -221,23 +223,55 @@ class Tubelet:
         self.frame_ids = list(-fid for fid in reversed(self.frame_ids))
         self.last_key_instance_index = restore_last_key_instance_index(self.proposal_instances)
 
-        self.extend_after(-frame_index, proposal_instances)
+        was_extended = self.extend_after(-frame_index, proposal_instances)
 
         self.proposal_instances.reverse()
         self.proposal_instances_ious.reverse()
         self.projected_proposal_instances.reverse()
         self.frame_ids = list(-fid for fid in reversed(self.frame_ids))
         self.last_key_instance_index = restore_last_key_instance_index(self.proposal_instances)
+        return was_extended
 
 
-    def collides_with(self, frame_index, proposal_instance):
-        last_index = self.frame_ids[-1]
+    def collides_with(self, frame_id, proposal_instance, use_iou=False):
+        """last_index = self.frame_ids[-1]
         if last_index != frame_index:
             return False
-        last_instance = self.proposal_instances[-1]
-        iou = pairwise_iou(last_instance.pred_boxes, proposal_instance.pred_boxes)
-        if iou > self.iou_threshold:
-            return True
+        last_instance = self.proposal_instances[-1]"""
+
+        tubelet_instance = self.get_instance(frame_id)
+        if tubelet_instance is None:
+            return torch.zeros(len(proposal_instances), dtype=torch.bool)
+        if use_iou:
+            iou = pairwise_iou(tubelet_instance.pred_boxes, proposal_instance.pred_boxes)
+            return iou > self.iou_threshold
+        else:
+            last_instance_box = Boxes(tubelet_instance.pred_boxes.tensor)
+            proposal_instance_box = Boxes(proposal_instance.pred_boxes.tensor)
+            last_instance_area = last_instance_box.area()
+            proposal_instance_area = proposal_instance_box.area()
+            intersection = pairwise_intersection(tubelet_instance.pred_boxes, proposal_instance.pred_boxes)
+            return intersection / last_instance_area > 0.8 or intersection / proposal_instance_area > 0.8
+
+    def collides_with_mask(self, frame_id, proposal_instances, use_iou=False):
+        """last_index = self.frame_ids[-1]
+        if last_index != frame_index:
+            return torch.zeros(len(proposal_instances), dtype=torch.bool)
+        last_instance = self.proposal_instances[-1]"""
+
+        tubelet_instance = self.get_instance(frame_id)
+        if tubelet_instance is None:
+            return torch.zeros(len(proposal_instances), dtype=torch.bool)
+        if use_iou:
+            iou = pairwise_iou(tubelet_instance.pred_boxes, proposal_instances.pred_boxes)
+            return (iou > self.iou_threshold)[0,:]
+        else:
+            last_instance_box = Boxes(tubelet_instance.pred_boxes.tensor)
+            proposal_instance_boxes = Boxes(proposal_instances.pred_boxes.tensor)
+            last_instance_area = last_instance_box.area()
+            proposal_instance_area = proposal_instance_boxes.area()
+            intersections = pairwise_intersection(tubelet_instance.pred_boxes, proposal_instances.pred_boxes)
+            return ((intersections / last_instance_area > 0.8) | (intersections / proposal_instance_area > 0.8))[0, :]
 
     def __len__(self):
         return len(self.frame_ids)
@@ -326,29 +360,36 @@ def generate_tubelets(
                 proposal_instances = proposals_dict[frame_path]
                 proposal_instances_after_nms = proposal_instances[nms(proposal_instances.pred_boxes.tensor, proposal_instances.class_distributions[:, class_index_to_detect], nms_iou_threshold)]
                 proposals_dict_after_nms[frame_path] = proposal_instances_after_nms
+                non_colliding_proposal_mask = torch.zeros(len(proposal_instances_after_nms), dtype=torch.bool)
                 for tubelet_id, tubelet in enumerate(tubelets):
-                    tubelet.extend_after(i+start_frame, proposal_instances_after_nms)
-                key_proposal_indices = torch.nonzero((proposal_instances_after_nms.scores > score_threshold) & (proposal_instances_after_nms.pred_classes == class_index_to_detect))
+                    tubelet.extend_after(start_frame + i, proposal_instances_after_nms[torch.nonzero(~non_colliding_proposal_mask)[:,0]])
+                    non_colliding_proposal_mask = non_colliding_proposal_mask | tubelet.collides_with_mask(start_frame + i, proposal_instances_after_nms)
+                key_proposal_indices = torch.nonzero((proposal_instances_after_nms.scores > score_threshold) & (proposal_instances_after_nms.pred_classes == class_index_to_detect) & ~non_colliding_proposal_mask)
                 for key_proposal_index in key_proposal_indices:
-                    if not any(t.collides_with(i+start_frame, proposal_instances_after_nms[key_proposal_index]) for t in tubelets):
-                        tubelets.append(Tubelet(
-                            start_index = i+start_frame,
-                            proposal_instance = proposal_instances_after_nms[key_proposal_index],
-                            class_to_detect = class_index_to_detect,
-                            iou_threshold = tubelet_iou_threshold,
-                            extend_class_only = extend_class_only,
-                            num_skippable_frames = num_skippable_frames,
-                            max_dimension_change_ratio = max_dimension_change_ratio,
-                            max_dimension_change_abs = max_dimension_change_abs,
-                            perform_projection = perform_projection
-                        ))
+                    tubelets.append(Tubelet(
+                        start_index = i+start_frame,
+                        proposal_instance = proposal_instances_after_nms[key_proposal_index],
+                        class_to_detect = class_index_to_detect,
+                        iou_threshold = tubelet_iou_threshold,
+                        extend_class_only = extend_class_only,
+                        num_skippable_frames = num_skippable_frames,
+                        max_dimension_change_ratio = max_dimension_change_ratio,
+                        max_dimension_change_abs = max_dimension_change_abs,
+                        perform_projection = perform_projection
+                    ))
         print(f"Tubelet backward pass through {len(proposals_dict)} frames ...")
         with tqdm.tqdm(total=len(proposals_dict_after_nms)) as pbar:
             for i, frame_path in enumerate(reversed(sorted(proposals_dict_after_nms.keys()))):
                 pbar.update(1)
                 proposal_instances_after_nms = proposals_dict_after_nms[frame_path]
+                colliding_proposal_mask = torch.zeros(len(proposal_instances_after_nms), dtype=torch.bool)
                 for tubelet in tubelets:
-                    tubelet.extend_before(start_frame + len(proposals_dict_after_nms) - i - 1, proposal_instances_after_nms)
+                    tubelet_colliding_proposal_mask = tubelet.collides_with_mask(start_frame + len(proposals_dict_after_nms) - i - 1, proposal_instances_after_nms)
+                    colliding_proposal_mask = colliding_proposal_mask | tubelet_colliding_proposal_mask
+                for tubelet in tubelets:
+                    if tubelet.extend_before(start_frame + len(proposals_dict_after_nms) - i - 1, proposal_instances_after_nms[torch.nonzero(~colliding_proposal_mask)[:,0]]):
+                        tubelet_colliding_proposal_mask = tubelet.collides_with_mask(start_frame + len(proposals_dict_after_nms) - i - 1, proposal_instances_after_nms)
+                        colliding_proposal_mask = colliding_proposal_mask | tubelet_colliding_proposal_mask
     else:
         raise ValueError(f"Unknown method: {args.method}")
 
@@ -407,12 +448,6 @@ def render_frame(prms):
     tubelet_instances = []
     tubelet_instance_projections = []
     for tubelet_id, tubelet in enumerate(tubelets):
-        if frame_id == 280 and tubelet_id == 99:
-            p = 0
-
-        if tubelet.is_dead(frame_id):
-            continue
-
         tubelet_ids.append(tubelet_id)
         tubelet_instances.append(tubelet.get_instance(frame_id))
         tubelet_instance_projections.append(tubelet.get_projected_instance(frame_id))
