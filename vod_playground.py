@@ -90,7 +90,7 @@ def preprocess_video(args, batch_size=1):
 
 
 class Tubelet:
-    def __init__(self, start_index, proposal_instance, iou_threshold=0.7, num_skippable_frames=7, extend_class_only=False, class_to_detect=0, max_dimension_change_ratio=0.2):
+    def __init__(self, start_index, proposal_instance, iou_threshold=0.7, num_skippable_frames=7, extend_class_only=False, class_to_detect=0, max_dimension_change_ratio=None, max_dimension_change_abs=None, perform_projection=True):
         proposal_instance.generation_process = ["K"]
 
         self.frame_ids = [start_index]
@@ -103,6 +103,8 @@ class Tubelet:
         self.extend_class_only = extend_class_only
         self.class_to_detect = class_to_detect
         self.max_dimension_change_ratio = max_dimension_change_ratio
+        self.max_dimension_change_abs = max_dimension_change_abs
+        self.perform_projection = perform_projection
 
     def project_proposal_instance(self, frame_index):
         if len(self.proposal_instances) == 1:
@@ -148,14 +150,22 @@ class Tubelet:
             return
 
         last_key_instance_index = self.last_key_instance_index[-1]
-        projected_last_instance = self.project_proposal_instance(frame_index)
+        if self.perform_projection:
+            projected_last_instance = self.project_proposal_instance(frame_index)
+        elif self.perform_projection:
+            projected_last_instance = self.proposal_instances[last_key_instance_index]
+
+        projection_dim = projected_last_instance.pred_boxes.tensor[:, 2:] - projected_last_instance.pred_boxes.tensor[:, :2]
+        proposals_dim = proposal_instances.pred_boxes.tensor[:, 2:] - proposal_instances.pred_boxes.tensor[:, :2]
 
         if self.max_dimension_change_ratio is not None:
-            # Filter all proposals the expand the tubelet too much in terms of bbox dimensions
-            projection_dim = projected_last_instance.pred_boxes.tensor[:, 2:] - projected_last_instance.pred_boxes.tensor[:, :2]
-            proposals_dim = proposal_instances.pred_boxes.tensor[:, 2:] - proposal_instances.pred_boxes.tensor[:, :2]
             dim_ratios = proposals_dim / projection_dim
-            selection_mask = torch.any((dim_ratios > 1 - self.max_dimension_change_ratio) & (dim_ratios < 1 + self.max_dimension_change_ratio), dim=1)
+            selection_mask = torch.all((dim_ratios > 1 - self.max_dimension_change_ratio) & (dim_ratios < 1 + self.max_dimension_change_ratio), dim=1)
+            proposal_instances = proposal_instances[selection_mask]
+
+        if self.max_dimension_change_abs is not None:
+            dim_diffs = torch.abs(proposals_dim - projection_dim)
+            selection_mask = torch.all(dim_diffs < self.max_dimension_change_abs, dim=1)
             proposal_instances = proposal_instances[selection_mask]
 
         if len(proposal_instances) == 0:
@@ -274,13 +284,16 @@ class Tubelet:
 def generate_tubelets(
         args,
         proposals_dict,
-        score_threshold=0.5,
+        score_threshold=0.7,
         start_frame=0,
         class_index_to_detect=0,
-        iou_threshold=0.5,
-        extend_class_only=False,
+        tubelet_iou_threshold=0.2,
+        nms_iou_threshold=0.4,
+        extend_class_only=True,
         num_skippable_frames=5,
-        max_dimension_change_ratio=0.1
+        max_dimension_change_ratio=None,
+        max_dimension_change_abs=15,
+        perform_projection=True
 ):
     tubelets = []
     if args.method in {"all", "threshold", "nms"}:
@@ -294,7 +307,7 @@ def generate_tubelets(
                     surviving_instances = proposal_instances[proposal_instances.class_distributions[:, class_index_to_detect] > score_threshold]
                 elif args.method == "nms":
                     surviving_instances = proposal_instances[proposal_instances.class_distributions[:, class_index_to_detect] > score_threshold]
-                    surviving_indices = nms(surviving_instances.pred_boxes.tensor, surviving_instances.class_distributions[:, class_index_to_detect], iou_threshold)
+                    surviving_indices = nms(surviving_instances.pred_boxes.tensor, surviving_instances.class_distributions[:, class_index_to_detect], nms_iou_threshold)
                     surviving_instances = surviving_instances[surviving_indices]
 
                 # Generate one tubelet for each proposal
@@ -311,7 +324,7 @@ def generate_tubelets(
             for i, frame_path in enumerate(sorted(proposals_dict.keys())):
                 pbar.update(1)
                 proposal_instances = proposals_dict[frame_path]
-                proposal_instances_after_nms = proposal_instances[nms(proposal_instances.pred_boxes.tensor, proposal_instances.class_distributions[:, class_index_to_detect], iou_threshold)]
+                proposal_instances_after_nms = proposal_instances[nms(proposal_instances.pred_boxes.tensor, proposal_instances.class_distributions[:, class_index_to_detect], nms_iou_threshold)]
                 proposals_dict_after_nms[frame_path] = proposal_instances_after_nms
                 for tubelet_id, tubelet in enumerate(tubelets):
                     tubelet.extend_after(i+start_frame, proposal_instances_after_nms)
@@ -322,10 +335,12 @@ def generate_tubelets(
                             start_index = i+start_frame,
                             proposal_instance = proposal_instances_after_nms[key_proposal_index],
                             class_to_detect = class_index_to_detect,
-                            iou_threshold = iou_threshold,
+                            iou_threshold = tubelet_iou_threshold,
                             extend_class_only = extend_class_only,
                             num_skippable_frames = num_skippable_frames,
-                            max_dimension_change_ratio = max_dimension_change_ratio
+                            max_dimension_change_ratio = max_dimension_change_ratio,
+                            max_dimension_change_abs = max_dimension_change_abs,
+                            perform_projection = perform_projection
                         ))
         print(f"Tubelet backward pass through {len(proposals_dict)} frames ...")
         with tqdm.tqdm(total=len(proposals_dict_after_nms)) as pbar:
@@ -347,6 +362,9 @@ def draw_instance_predictions(visualizer, tubelet_ids, tubelet_instances, tubele
     def get_color(i):
         colors = "bgrcmykw"
         return colors[i % len(colors)]
+
+    if not any(tubelet_instances):
+        return visualizer.output
 
     tubelet_instance_ids = [i for i, inst in zip(tubelet_ids, tubelet_instances) if inst is not None]
     tubelet_instances = Instances.cat([inst for inst in tubelet_instances if inst is not None])
@@ -546,14 +564,14 @@ def load_model(config_only=False, architecture="faster_rcnn_50"):
 
 
 def assemble_results(args):
-    for method in {"threshold", "nms", "tubelet"}:
-        source_path = args.working_dir / args.video_id / f"rendered_frames__{method}" / "frame_%04d.jpg"
-        target_path = args.working_dir / args.video_id / f"video__{method}.mp4"
-        if target_path.exists():
-            print(f"Target video {target_path} already exists")
-        else:
-            print(f"Assembling video {target_path}")
-            subprocess.run(["ffmpeg", "-r", "25", "-start_number", "1500", "-i", str(source_path), "-y", str(target_path)])
+    source_path = args.working_dir / args.video_id / f"rendered_frames__{args.method}" / "frame_%04d.jpg"
+    target_path = args.working_dir / args.video_id / f"video__{args.method}.mp4"
+    if target_path.exists():
+        print(f"Target video {target_path} already exists")
+    else:
+        print(f"Assembling video {target_path}")
+        #subprocess.run(["ffmpeg", "-r", "25", "-start_number", "1500", "-i", str(source_path), "-y", str(target_path)])
+        subprocess.run(["ffmpeg", "-r", "25", "-i", str(source_path), "-y", str(target_path)])
 
 
 if __name__ == "__main__":
@@ -569,7 +587,7 @@ if __name__ == "__main__":
 
     args.working_dir = Path(args.working_dir)
     args.frame_start = int(args.frame_start) if args.frame_start is not None else None
-    args.frame_stop = int(args.frame_stop) if args.frame_start is not None else None
+    args.frame_stop = int(args.frame_stop) if args.frame_stop is not None else None
 
     if args.action == "preprocess_video":
         preprocess_video(args)
