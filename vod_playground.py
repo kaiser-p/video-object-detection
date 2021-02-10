@@ -252,37 +252,6 @@ class Tubelet:
         self.last_key_instance_index = restore_last_key_instance_index(self.proposal_instances)
         return result_iou_mask
 
-
-    def collides_with(self, frame_id, proposal_instance, use_iou=False):
-        tubelet_instance = self.get_instance(frame_id)
-        if tubelet_instance is None:
-            return False
-        if use_iou:
-            iou = pairwise_iou(tubelet_instance.pred_boxes, proposal_instance.pred_boxes)
-            return iou > self.iou_threshold
-        else:
-            last_instance_box = Boxes(tubelet_instance.pred_boxes.tensor)
-            proposal_instance_box = Boxes(proposal_instance.pred_boxes.tensor)
-            last_instance_area = last_instance_box.area()
-            proposal_instance_area = proposal_instance_box.area()
-            intersection = pairwise_intersection(tubelet_instance.pred_boxes, proposal_instance.pred_boxes)
-            return intersection / last_instance_area > 0.8 or intersection / proposal_instance_area > 0.8
-
-    def collides_with_mask(self, frame_id, proposal_instances, use_iou=False):
-        tubelet_instance = self.get_instance(frame_id)
-        if tubelet_instance is None:
-            return torch.zeros(len(proposal_instances), dtype=torch.bool)
-        if use_iou:
-            iou = pairwise_iou(tubelet_instance.pred_boxes, proposal_instances.pred_boxes)
-            return (iou > self.iou_threshold)[0,:]
-        else:
-            last_instance_box = Boxes(tubelet_instance.pred_boxes.tensor)
-            proposal_instance_boxes = Boxes(proposal_instances.pred_boxes.tensor)
-            last_instance_area = last_instance_box.area()
-            proposal_instance_area = proposal_instance_boxes.area()
-            intersections = pairwise_intersection(tubelet_instance.pred_boxes, proposal_instances.pred_boxes)
-            return ((intersections / last_instance_area > 0.8) | (intersections / proposal_instance_area > 0.8))[0, :]
-
     def __len__(self):
         return len(self.frame_ids)
 
@@ -331,15 +300,15 @@ def generate_tubelets(
     score_threshold=0.7,
     start_frame=0,
     class_index_to_detect=0,
-    tubelet_iou_threshold=0.2,
+    tubelet_iou_threshold=0.1,
     nms_iou_threshold=0.4,
-    extend_class_only=True,
-    num_skippable_frames=5,
-    max_dimension_change_ratio=0.1,
+    extend_class_only=False,
+    num_skippable_frames=20,
+    max_dimension_change_ratio=0.3,
     max_dimension_change_abs=15,
     perform_projection=True,
-    min_extension_probability=0.1,
-    min_extension_probability_after_skipped_frames=0.2
+    min_extension_probability=0.01,
+    min_extension_probability_after_skipped_frames=0.01
 ):
     tubelets = []
     if args.method in {"all", "threshold", "nms"}:
@@ -364,10 +333,9 @@ def generate_tubelets(
                             class_to_detect = class_index_to_detect
                         ))
     elif args.method == "tubelet":
-        print(f"Tubelet forward pass through {len(proposals_dict)} frames ...")
         proposals_dict_after_nms = {}
         proposal_selection_masks = {}
-        with tqdm.tqdm(total=len(proposals_dict)) as pbar:
+        with tqdm.tqdm(total=2*len(proposals_dict)) as pbar:
             for i, frame_path in enumerate(sorted(proposals_dict.keys())):
                 pbar.update(1)
                 proposal_instances = proposals_dict[frame_path]
@@ -394,8 +362,6 @@ def generate_tubelets(
                     ))
                 proposal_selection_masks[frame_path] = proposal_selection_mask & ~key_proposal_mask
 
-        print(f"Tubelet backward pass through {len(proposals_dict)} frames ...")
-        with tqdm.tqdm(total=len(proposals_dict_after_nms)) as pbar:
             for i, frame_path in enumerate(reversed(sorted(proposals_dict_after_nms.keys()))):
                 pbar.update(1)
                 proposal_instances_after_nms = proposals_dict_after_nms[frame_path]
@@ -409,6 +375,7 @@ def generate_tubelets(
     print()
     print(f"Tubelet statistics:")
     print(f"    - Overall: {len(tubelets)}, avergae length: {sum(len(t) for t in tubelets) / len(tubelets) if tubelets else 0}")
+    print(f"    - Total detections: {sum(len(t) for t in tubelets)}")
     return tubelets
 
 
@@ -618,7 +585,6 @@ def assemble_results(args):
         print(f"Target video {target_path} already exists")
     else:
         print(f"Assembling video {target_path}")
-        #subprocess.run(["ffmpeg", "-r", "25", "-start_number", "1500", "-i", str(source_path), "-y", str(target_path)])
         subprocess.run(["ffmpeg", "-r", "25", "-i", str(source_path), "-y", str(target_path)])
 
 
