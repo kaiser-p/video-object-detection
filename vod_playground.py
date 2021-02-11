@@ -5,19 +5,18 @@ import cv2
 import tqdm
 import subprocess
 import pickle
-import time
+import dataclasses
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-import numpy as np
 
 import torch
 import detectron2
 from detectron2.engine import DefaultPredictor
 from detectron2.config import get_cfg
-from detectron2.utils.visualizer import Visualizer, GenericMask, _create_text_labels
+from detectron2.utils.visualizer import Visualizer, _create_text_labels
 from detectron2.data import MetadataCatalog
 from detectron2.structures import Instances
-from detectron2.structures.boxes import Boxes, pairwise_iou, pairwise_ioa, pairwise_intersection
+from detectron2.structures.boxes import Boxes, pairwise_iou
 from torchvision.ops import nms
 
 
@@ -90,21 +89,23 @@ def preprocess_video(args, batch_size=1):
                         pickle.dump(proposals, f_out)
 
 
+@dataclasses.dataclass
+class TubeletAlgorithmConfig:
+    class_index_to_detect: str
+    score_threshold: float
+    tubelet_iou_threshold: float
+    nms_iou_threshold: float
+    extend_class_only: bool
+    num_skippable_frames: int
+    max_dimension_change_ratio: float
+    max_dimension_change_abs: float
+    perform_projection: bool
+    min_extension_probability: float
+    min_extension_probability_after_skipped_frames: float
+
+
 class Tubelet:
-    def __init__(
-            self,
-            start_index,
-            proposal_instance,
-            iou_threshold=0.7,
-            num_skippable_frames=7,
-            extend_class_only=False,
-            class_to_detect=0,
-            max_dimension_change_ratio=None,
-            max_dimension_change_abs=None,
-            perform_projection=True,
-            min_extension_probability=0.1,
-            min_extension_probability_after_skipped_frames=0.2
-    ):
+    def __init__(self, start_index, proposal_instance, config):
         proposal_instance.generation_process = ["K"]
 
         self.frame_ids = [start_index]
@@ -112,15 +113,7 @@ class Tubelet:
         self.proposal_instances = [proposal_instance]
         self.projected_proposal_instances = [proposal_instance]
         self.proposal_instances_ious = [0]
-        self.iou_threshold = iou_threshold
-        self.num_skippable_frames = num_skippable_frames
-        self.extend_class_only = extend_class_only
-        self.class_to_detect = class_to_detect
-        self.max_dimension_change_ratio = max_dimension_change_ratio
-        self.max_dimension_change_abs = max_dimension_change_abs
-        self.perform_projection = perform_projection
-        self.min_extension_probability = min_extension_probability
-        self.min_extension_probability_after_skipped_frames = min_extension_probability_after_skipped_frames
+        self.config = config
 
     def project_proposal_instance(self, frame_index):
         if len(self.proposal_instances) == 1:
@@ -159,7 +152,7 @@ class Tubelet:
 
     def is_dead(self, frame_index):
         last_index = self.frame_ids[-1]
-        return frame_index - last_index > self.num_skippable_frames
+        return frame_index - last_index > self.config.num_skippable_frames
 
     def extend_after(self, frame_index, proposal_instances, prior_selection_mask):
         result_iou_mask = torch.zeros(prior_selection_mask.shape, dtype=torch.bool)
@@ -169,36 +162,36 @@ class Tubelet:
             return result_iou_mask
 
         last_key_instance_index = self.last_key_instance_index[-1]
-        if self.perform_projection:
+        if self.config.perform_projection:
             projected_last_instance = self.project_proposal_instance(frame_index)
         else:
             projected_last_instance = self.proposal_instances[last_key_instance_index]
 
         iou_per_proposal = pairwise_iou(proposal_instances.pred_boxes, projected_last_instance.pred_boxes).squeeze()
-        result_iou_mask = (iou_per_proposal > self.iou_threshold)
+        result_iou_mask = (iou_per_proposal > self.config.tubelet_iou_threshold)
         selection_mask = prior_selection_mask & result_iou_mask
 
         projection_dim = projected_last_instance.pred_boxes.tensor[:, 2:] - projected_last_instance.pred_boxes.tensor[:, :2]
         proposals_dim = proposal_instances.pred_boxes.tensor[:, 2:] - proposal_instances.pred_boxes.tensor[:, :2]
         selection_mask_rel = selection_mask_abs = selection_mask
-        if self.max_dimension_change_ratio is not None:
+        if self.config.max_dimension_change_ratio is not None:
             dim_ratios = proposals_dim / projection_dim
-            selection_mask_rel = torch.all((dim_ratios > 1 - self.max_dimension_change_ratio) & (dim_ratios < 1 + self.max_dimension_change_ratio), dim=1)
-        if self.max_dimension_change_abs is not None:
+            selection_mask_rel = torch.all((dim_ratios > 1 - self.config.max_dimension_change_ratio) & (dim_ratios < 1 + self.config.max_dimension_change_ratio), dim=1)
+        if self.config.max_dimension_change_abs is not None:
             dim_diffs = torch.abs(proposals_dim - projection_dim)
-            selection_mask_abs = torch.all(dim_diffs < self.max_dimension_change_abs, dim=1)
+            selection_mask_abs = torch.all(dim_diffs < self.config.max_dimension_change_abs, dim=1)
         selection_mask &= (selection_mask_rel | selection_mask_abs)
 
-        if self.extend_class_only:
+        if self.config.extend_class_only:
             # Ignore all proposals of different classes
-            selection_mask &= (proposal_instances.pred_classes == self.class_to_detect)
+            selection_mask &= (proposal_instances.pred_classes == self.config.class_index_to_detect)
 
-        if self.min_extension_probability is not None:
-            selection_mask &= (proposal_instances.class_distributions[:, self.class_to_detect] > self.min_extension_probability)
+        if self.config.min_extension_probability is not None:
+            selection_mask &= (proposal_instances.class_distributions[:, self.config.class_index_to_detect] > self.config.min_extension_probability)
 
         last_index = self.frame_ids[-1]
-        if last_index + 1 != frame_index and self.min_extension_probability_after_skipped_frames is not None:
-            selection_mask &= (proposal_instances.class_distributions[:, self.class_to_detect] > self.min_extension_probability_after_skipped_frames)
+        if last_index + 1 != frame_index and self.config.min_extension_probability_after_skipped_frames is not None:
+            selection_mask &= (proposal_instances.class_distributions[:, self.config.class_index_to_detect] > self.config.min_extension_probability_after_skipped_frames)
 
         iou_per_proposal[~selection_mask] = 0
         if not torch.any(iou_per_proposal > 0):
@@ -294,22 +287,8 @@ class Tubelet:
 
 
 
-def generate_tubelets(
-    args,
-    proposals_dict,
-    score_threshold=0.7,
-    start_frame=0,
-    class_index_to_detect=0,
-    tubelet_iou_threshold=0.1,
-    nms_iou_threshold=0.4,
-    extend_class_only=False,
-    num_skippable_frames=20,
-    max_dimension_change_ratio=0.3,
-    max_dimension_change_abs=15,
-    perform_projection=True,
-    min_extension_probability=0.01,
-    min_extension_probability_after_skipped_frames=0.01
-):
+def generate_tubelets(args, proposals_dict, config):
+    start_frame = args.frame_start if args.frame_start is not None else 0
     tubelets = []
     if args.method in {"all", "threshold", "nms"}:
         with tqdm.tqdm(total=len(proposals_dict)) as pbar:
@@ -319,19 +298,15 @@ def generate_tubelets(
                 if args.method == "all":
                     surviving_instances = proposal_instances
                 elif args.method == "threshold":
-                    surviving_instances = proposal_instances[proposal_instances.class_distributions[:, class_index_to_detect] > score_threshold]
+                    surviving_instances = proposal_instances[proposal_instances.class_distributions[:, config.lass_index_to_detect] > config.score_threshold]
                 elif args.method == "nms":
-                    surviving_instances = proposal_instances[proposal_instances.class_distributions[:, class_index_to_detect] > score_threshold]
-                    surviving_indices = nms(surviving_instances.pred_boxes.tensor, surviving_instances.class_distributions[:, class_index_to_detect], nms_iou_threshold)
+                    surviving_instances = proposal_instances[proposal_instances.class_distributions[:, config.class_index_to_detect] > config.score_threshold]
+                    surviving_indices = nms(surviving_instances.pred_boxes.tensor, surviving_instances.class_distributions[:, config.class_index_to_detect], config.nms_iou_threshold)
                     surviving_instances = surviving_instances[surviving_indices]
 
                 # Generate one tubelet for each proposal
                 for proposal_index in range(len(surviving_instances)):
-                    tubelets.append(Tubelet(
-                            start_index = i+start_frame,
-                            proposal_instance = surviving_instances[proposal_index],
-                            class_to_detect = class_index_to_detect
-                        ))
+                    tubelets.append(Tubelet(i+start_frame, surviving_instances[proposal_index], config))
     elif args.method == "tubelet":
         proposals_dict_after_nms = {}
         proposal_selection_masks = {}
@@ -339,27 +314,15 @@ def generate_tubelets(
             for i, frame_path in enumerate(sorted(proposals_dict.keys())):
                 pbar.update(1)
                 proposal_instances = proposals_dict[frame_path]
-                proposal_instances_after_nms = proposal_instances[nms(proposal_instances.pred_boxes.tensor, proposal_instances.class_distributions[:, class_index_to_detect], nms_iou_threshold)]
+                proposal_instances_after_nms = proposal_instances[nms(proposal_instances.pred_boxes.tensor, proposal_instances.class_distributions[:, config.class_index_to_detect], config.nms_iou_threshold)]
                 proposals_dict_after_nms[frame_path] = proposal_instances_after_nms
                 proposal_selection_mask = torch.ones(len(proposal_instances_after_nms), dtype=torch.bool)
                 for tubelet_id, tubelet in enumerate(tubelets):
                     result_iou_mask = tubelet.extend_after(start_frame + i, proposal_instances_after_nms, proposal_selection_mask)
                     proposal_selection_mask &= ~result_iou_mask
-                key_proposal_mask = proposal_selection_mask & (proposal_instances_after_nms.scores > score_threshold) & (proposal_instances_after_nms.pred_classes == class_index_to_detect)
+                key_proposal_mask = proposal_selection_mask & (proposal_instances_after_nms.scores > config.score_threshold) & (proposal_instances_after_nms.pred_classes == config.class_index_to_detect)
                 for key_proposal_index in torch.nonzero(key_proposal_mask):
-                    tubelets.append(Tubelet(
-                        start_index = i+start_frame,
-                        proposal_instance = proposal_instances_after_nms[key_proposal_index],
-                        class_to_detect = class_index_to_detect,
-                        iou_threshold = tubelet_iou_threshold,
-                        extend_class_only = extend_class_only,
-                        num_skippable_frames = num_skippable_frames,
-                        max_dimension_change_ratio = max_dimension_change_ratio,
-                        max_dimension_change_abs = max_dimension_change_abs,
-                        perform_projection = perform_projection,
-                        min_extension_probability=min_extension_probability,
-                        min_extension_probability_after_skipped_frames = min_extension_probability_after_skipped_frames
-                    ))
+                    tubelets.append(Tubelet(i+start_frame, proposal_instances_after_nms[key_proposal_index], config))
                 proposal_selection_masks[frame_path] = proposal_selection_mask & ~key_proposal_mask
 
             for i, frame_path in enumerate(reversed(sorted(proposals_dict_after_nms.keys()))):
@@ -441,9 +404,8 @@ def render_frame(prms):
         cv2.imwrite(str(rendered_frame_path), frame)
 
 
-def render_video(args):
+def render_video(args, config):
     cfg, _ = load_model(config_only=True)
-
     proposals_dir = args.working_dir / args.video_id / "proposals"
     frames_dir = args.working_dir / args.video_id / "frames"
     rendered_frames_dir = args.working_dir / args.video_id / f"rendered_frames__{args.method}"
@@ -472,14 +434,7 @@ def render_video(args):
             proposals_dict[frame_path] = proposals
 
     print(f"Generating tubelets for {args.video_id}")
-    classes = MetadataCatalog.get(cfg.DATASETS.TRAIN[0]).thing_classes
-    class_index_to_detect = classes.index(args.class_to_detect)
-    tubelets = generate_tubelets(
-        args,
-        proposals_dict,
-        start_frame=args.frame_start if args.frame_start is not None else 0,
-        class_index_to_detect=class_index_to_detect
-    )
+    tubelets = generate_tubelets(args, proposals_dict, config)
 
     rendering_prms = []
     for i, frame_path in enumerate(frame_list):
@@ -493,23 +448,6 @@ def render_video(args):
     print(f"Rendering {len(rendering_prms)} frames for {args.video_id}.")
     with ThreadPoolExecutor(max_workers=30) as executor:
         result = list(tqdm.tqdm(executor.map(render_frame, rendering_prms), total=len(rendering_prms)))
-
-
-def restrict_predictions(cfg, predictions, allowed_classes=None):
-    if allowed_classes is None:
-        return predictions
-
-    classes = MetadataCatalog.get(cfg.DATASETS.TRAIN[0]).thing_classes
-    allowed_class_indices = {classes.index(c) for c in allowed_classes}
-    instances_to_keep = [i for i,c in enumerate(predictions["instances"].pred_classes.numpy()) if c in allowed_class_indices]
-
-    return {"instances": Instances(
-        image_size=predictions["instances"].image_size,
-        pred_boxes=predictions["instances"].pred_boxes[instances_to_keep],
-        scores=predictions["instances"].scores[instances_to_keep],
-        pred_classes=predictions["instances"].pred_classes[instances_to_keep],
-        class_distributions=predictions["instances"].class_distributions[instances_to_keep]
-    )}
 
 
 def generate_poposals(images, model, score_threshold=0):
@@ -585,28 +523,89 @@ def assemble_results(args):
         print(f"Target video {target_path} already exists")
     else:
         print(f"Assembling video {target_path}")
-        subprocess.run(["ffmpeg", "-r", "25", "-i", str(source_path), "-y", str(target_path)])
+        subprocess.run(f"ffmpeg -r 25 -i {source_path} -y {target_path}".split())
+
+
+def generate_config(args):
+    cfg, _ = load_model(config_only=True)
+    classes = MetadataCatalog.get(cfg.DATASETS.TRAIN[0]).thing_classes
+
+    if args.video_id == "eKKdRy20HXI":
+        return TubeletAlgorithmConfig(
+            class_index_to_detect=classes.index("car"),
+            score_threshold=0.7,
+            tubelet_iou_threshold=0.1,
+            nms_iou_threshold=0.4,
+            extend_class_only=False,
+            num_skippable_frames=20,
+            max_dimension_change_ratio=0.3,
+            max_dimension_change_abs=15,
+            perform_projection=True,
+            min_extension_probability=0.01,
+            min_extension_probability_after_skipped_frames=0.01
+        )
+    elif args.video_id == "fgHjVvqLXV8":
+        return TubeletAlgorithmConfig(
+            class_index_to_detect=classes.index("airplane"),
+            score_threshold=0.7,
+            tubelet_iou_threshold=0.1,
+            nms_iou_threshold=0.4,
+            extend_class_only=False,
+            num_skippable_frames=20,
+            max_dimension_change_ratio=0.3,
+            max_dimension_change_abs=15,
+            perform_projection=True,
+            min_extension_probability=0.01,
+            min_extension_probability_after_skipped_frames=0.01
+        )
+    elif args.video_id == "3h6aLq2kjxg":
+        return TubeletAlgorithmConfig(
+            class_index_to_detect=classes.index("traffic light"),
+            score_threshold=0.7,
+            tubelet_iou_threshold=0.1,
+            nms_iou_threshold=0.4,
+            extend_class_only=False,
+            num_skippable_frames=20,
+            max_dimension_change_ratio=0.3,
+            max_dimension_change_abs=15,
+            perform_projection=True,
+            min_extension_probability=0.01,
+            min_extension_probability_after_skipped_frames=0.01
+        )
+    elif args.video_id == "AUyOZAfnehM":
+        return TubeletAlgorithmConfig(
+            class_index_to_detect=classes.index("sports ball"),
+            score_threshold=0.7,
+            tubelet_iou_threshold=0.1,
+            nms_iou_threshold=0.4,
+            extend_class_only=False,
+            num_skippable_frames=20,
+            max_dimension_change_ratio=0.3,
+            max_dimension_change_abs=15,
+            perform_projection=True,
+            min_extension_probability=0.01,
+            min_extension_probability_after_skipped_frames=0.01
+        )
+    else:
+        raise ValueError(f"Unknown video: {args.video_id}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("action", help="One of: preprocess_video, ...")
-    parser.add_argument("--working_dir", default="/tmp/video-object-detection/")
-    parser.add_argument("--video_id", default="eKKdRy20HXI")
-    parser.add_argument("--class_to_detect", default="car")
-    parser.add_argument("--frame_start", default=None)
-    parser.add_argument("--frame_stop", default=None)
-    parser.add_argument("--method", default="tubelet", help="One of: all, threshold, nms, tubelet")
+    parser.add_argument("--working_dir", type=Path, default="/tmp/video-object-detection/")
+    parser.add_argument("--video_id", default="eKKdRy20HXI", help="e.g.: eKKdRy20HXI, fgHjVvqLXV8, 3h6aLq2kjxg, AUyOZAfnehM")
+    parser.add_argument("--frame_start", type=int, default=None)
+    parser.add_argument("--frame_stop", type=int, default=None)
+    parser.add_argument("--method", default="tubelet", help="'nms' or 'tubelet'")
     args = parser.parse_args()
 
-    args.working_dir = Path(args.working_dir)
-    args.frame_start = int(args.frame_start) if args.frame_start is not None else None
-    args.frame_stop = int(args.frame_stop) if args.frame_stop is not None else None
+    config = generate_config(args)
 
     if args.action == "preprocess_video":
         preprocess_video(args)
     elif args.action == "render_video":
-        render_video(args)
+        render_video(args, config)
     elif args.action == "assemble_results":
         assemble_results(args)
     else:
