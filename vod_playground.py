@@ -11,9 +11,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import detectron2
+import detectron2.utils.visualizer as visualizer
 from detectron2.engine import DefaultPredictor
 from detectron2.config import get_cfg
-from detectron2.utils.visualizer import Visualizer, _create_text_labels
 from detectron2.data import MetadataCatalog
 from detectron2.structures import Instances
 from detectron2.structures.boxes import Boxes, pairwise_iou
@@ -342,26 +342,23 @@ def generate_tubelets(args, proposals_dict, config):
     return tubelets
 
 
-def draw_instance_predictions(visualizer, tubelet_ids, tubelet_instances, tubelet_instance_projections, draw_projections=False):
+def draw_instance_predictions(vis, tubelet_ids, tubelet_instances, tubelet_instance_projections, draw_projections=False):
     def get_color(i):
-        colors = "bgrcmykw"
+        colors = "bgrcmy"
         return colors[i % len(colors)]
 
     if not any(tubelet_instances):
-        return visualizer.output
+        return vis.output
 
     tubelet_instance_ids = [i for i, inst in zip(tubelet_ids, tubelet_instances) if inst is not None]
     tubelet_instances = Instances.cat([inst for inst in tubelet_instances if inst is not None])
 
-    tubelet_instance_projection_ids = [i for i, inst in zip(tubelet_ids, tubelet_instance_projections) if inst is not None]
-    tubelet_instance_projections = Instances.cat([inst for inst in tubelet_instance_projections if inst is not None])
-
-    labels = _create_text_labels(tubelet_instances.pred_classes, tubelet_instances.scores, visualizer.metadata.get("thing_classes", None))
+    labels = visualizer._create_text_labels(tubelet_instances.pred_classes, tubelet_instances.scores, vis.metadata.get("thing_classes", None))
     for i, tubelet_id in enumerate(tubelet_instance_ids):
         labels[i] = f"{labels[i]} ({tubelet_instances.generation_process[i]}, #{tubelet_id})"
 
     colors = [get_color(i) for i in tubelet_instance_ids]
-    visualizer.overlay_instances(
+    vis.overlay_instances(
         boxes=tubelet_instances.pred_boxes,
         labels=labels,
         assigned_colors=colors,
@@ -369,15 +366,17 @@ def draw_instance_predictions(visualizer, tubelet_ids, tubelet_instances, tubele
     )
 
     if draw_projections:
+        tubelet_instance_projection_ids = [i for i, inst in zip(tubelet_ids, tubelet_instance_projections) if inst is not None]
+        tubelet_instance_projections = Instances.cat([inst for inst in tubelet_instance_projections if inst is not None])
         colors = [get_color(i) for i in tubelet_instance_projection_ids]
         labels = [f"Pred. #{i}" for i in tubelet_instance_projection_ids]
-        visualizer.overlay_instances(
+        vis.overlay_instances(
             boxes=tubelet_instance_projections.pred_boxes,
             labels=labels,
             assigned_colors=colors,
             alpha=0.1,
         )
-    return visualizer.output
+    return vis.output
 
 
 def render_frame(prms):
@@ -396,12 +395,13 @@ def render_frame(prms):
         tubelet_instance_projections.append(tubelet.get_projected_instance(frame_id))
 
     frame = cv2.imread(str(frame_path))
-    if tubelet_ids:
-        v = Visualizer(frame[:, :, ::-1], MetadataCatalog.get(cfg.DATASETS.TRAIN[0]), scale=1.2)
-        v = draw_instance_predictions(v, tubelet_ids, tubelet_instances, tubelet_instance_projections)
-        cv2.imwrite(str(rendered_frame_path), v.get_image()[:, :, ::-1])
-    else:
-        cv2.imwrite(str(rendered_frame_path), frame)
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    frame = cv2.merge([frame, frame, frame])
+
+    visualizer._SMALL_OBJECT_AREA_THRESH = 1
+    v = visualizer.Visualizer(frame[:, :, ::-1], MetadataCatalog.get(cfg.DATASETS.TRAIN[0]), scale=1.2)
+    v = draw_instance_predictions(v, tubelet_ids, tubelet_instances, tubelet_instance_projections)
+    cv2.imwrite(str(rendered_frame_path), v.get_image()[:, :, ::-1])
 
 
 def render_video(args, config):
@@ -534,15 +534,15 @@ def generate_config(args):
         return TubeletAlgorithmConfig(
             class_index_to_detect=classes.index("car"),
             score_threshold=0.7,
-            tubelet_iou_threshold=0.1,
+            tubelet_iou_threshold=0.3,
             nms_iou_threshold=0.4,
             extend_class_only=False,
-            num_skippable_frames=20,
-            max_dimension_change_ratio=0.3,
-            max_dimension_change_abs=15,
+            num_skippable_frames=10,
+            max_dimension_change_ratio=0.4,
+            max_dimension_change_abs=20,
             perform_projection=True,
             min_extension_probability=0.01,
-            min_extension_probability_after_skipped_frames=0.01
+            min_extension_probability_after_skipped_frames=0.01,
         )
     elif args.video_id == "fgHjVvqLXV8":
         return TubeletAlgorithmConfig(
@@ -556,7 +556,7 @@ def generate_config(args):
             max_dimension_change_abs=15,
             perform_projection=True,
             min_extension_probability=0.01,
-            min_extension_probability_after_skipped_frames=0.01
+            min_extension_probability_after_skipped_frames=0.01,
         )
     elif args.video_id == "3h6aLq2kjxg":
         return TubeletAlgorithmConfig(
@@ -565,12 +565,12 @@ def generate_config(args):
             tubelet_iou_threshold=0.1,
             nms_iou_threshold=0.4,
             extend_class_only=False,
-            num_skippable_frames=20,
+            num_skippable_frames=5,
             max_dimension_change_ratio=0.3,
             max_dimension_change_abs=15,
             perform_projection=True,
             min_extension_probability=0.01,
-            min_extension_probability_after_skipped_frames=0.01
+            min_extension_probability_after_skipped_frames=0.01,
         )
     elif args.video_id == "AUyOZAfnehM":
         return TubeletAlgorithmConfig(
@@ -584,7 +584,7 @@ def generate_config(args):
             max_dimension_change_abs=15,
             perform_projection=True,
             min_extension_probability=0.01,
-            min_extension_probability_after_skipped_frames=0.01
+            min_extension_probability_after_skipped_frames=0.01,
         )
     else:
         raise ValueError(f"Unknown video: {args.video_id}")
